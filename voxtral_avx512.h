@@ -135,12 +135,25 @@ static void matvec_avx512bf16(
     #pragma omp parallel for schedule(static) private(j)
     for (j = 0; j < N; j++) {
         const uint16_t *b_row = B + (size_t)j * K;
-        __m512 sum = _mm512_setzero_ps();
+        
+        __m512 sum0 = _mm512_setzero_ps();
+        __m512 sum1 = _mm512_setzero_ps();
+        __m512 sum2 = _mm512_setzero_ps();
+        __m512 sum3 = _mm512_setzero_ps();
 
-        for (int kk = 0; kk < K_padded; kk += 32) {
-            sum = _mm512_dpbf16_ps(sum, voxtral_loadu_pbh(a_bf16 + kk), voxtral_loadu_pbh(b_row + kk));
+        int kk = 0;
+        for (; kk + 127 < K_padded; kk += 128) {
+            sum0 = _mm512_dpbf16_ps(sum0, voxtral_loadu_pbh(a_bf16 + kk + 0),  voxtral_loadu_pbh(b_row + kk + 0));
+            sum1 = _mm512_dpbf16_ps(sum1, voxtral_loadu_pbh(a_bf16 + kk + 32), voxtral_loadu_pbh(b_row + kk + 32));
+            sum2 = _mm512_dpbf16_ps(sum2, voxtral_loadu_pbh(a_bf16 + kk + 64), voxtral_loadu_pbh(b_row + kk + 64));
+            sum3 = _mm512_dpbf16_ps(sum3, voxtral_loadu_pbh(a_bf16 + kk + 96), voxtral_loadu_pbh(b_row + kk + 96));
         }
-        C[j] = _mm512_reduce_add_ps(sum);
+        for (; kk < K_padded; kk += 32) {
+            sum0 = _mm512_dpbf16_ps(sum0, voxtral_loadu_pbh(a_bf16 + kk), voxtral_loadu_pbh(b_row + kk));
+        }
+        
+        __m512 final_sum = _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3));
+        C[j] = _mm512_reduce_add_ps(final_sum);
     }
 
 #ifdef _MSC_VER
