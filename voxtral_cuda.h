@@ -8,50 +8,75 @@
 extern "C" {
 #endif
 
+/* CUDA Context for thread safety */
+typedef struct vox_cuda_ctx vox_cuda_ctx_t;
+
 /* Check if CUDA is available and supported on this system */
 int vox_cuda_available(void);
 
 /* Initialize CUDA context and resources */
-void vox_cuda_init(void);
+vox_cuda_ctx_t *vox_cuda_init(void);
 
 /* Shutdown CUDA and free resources */
-void vox_cuda_shutdown(void);
+void vox_cuda_shutdown(vox_cuda_ctx_t *ctx);
 
 /* Managed Memory (Unified) */
 void *vox_cuda_malloc_managed(size_t size);
 
-/* Allocate shared memory (accessible by both Host and Device) if unified memory is used, 
-   or just device memory. For now, mirroring metal's interface might change. */
-void *vox_cuda_malloc(size_t size);
-void vox_cuda_free(void *ptr);
+/* Allocate from a memory pool (recommended for activations/KV) */
+void *vox_cuda_malloc(vox_cuda_ctx_t *ctx, size_t size);
+void vox_cuda_free(vox_cuda_ctx_t *ctx, void *ptr);
+
+/* Memory pool management */
+void vox_cuda_pool_trim(vox_cuda_ctx_t *ctx);
+
+/* Graph capture */
+void vox_cuda_graph_begin(vox_cuda_ctx_t *ctx);
+void *vox_cuda_graph_end(vox_cuda_ctx_t *ctx);
+void vox_cuda_graph_exec(void *exec);
+void vox_cuda_graph_destroy(void *exec);
+
+/* KV Cache update kernel for Graphs */
+void vox_cuda_kv_cache_update(vox_cuda_ctx_t *ctx, float *cache_k, float *cache_v, const float *k, const float *v, 
+                              int layer, const int *pos_ptr, int max_seq, int kv_dim);
 
 /* Memory copy helpers */
 void vox_cuda_copy_to_device(void *dst, const void *src, size_t size);
 void vox_cuda_copy_to_host(void *dst, const void *src, size_t size);
 
 /* Math kernels */
-void vox_cuda_rms_norm(float *out, const float *x, const float *weight, int n, int hidden, float eps);
-void vox_cuda_silu(float *x, int n);
-void vox_cuda_gelu(float *x, int n);
-void vox_cuda_add_inplace(float *a, const float *b, int n);
-void vox_cuda_mul_inplace(float *a, const float *b, int n);
-void vox_cuda_axpy(float *a, float scale, const float *b, int n);
-void vox_cuda_bias_add(float *y, const float *b, int seq_len, int out_dim);
-void vox_cuda_rope(float *x, const float *freqs, int seq, int heads, int head_dim);
-void vox_cuda_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
+void vox_cuda_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const float *weight, int n, int hidden, float eps);
+void vox_cuda_rms_norm_residual(vox_cuda_ctx_t *ctx, float *out, float *x, const float *residual, const float *weight, int n, int hidden, float eps);
+void vox_cuda_rms_norm_ada_residual(vox_cuda_ctx_t *ctx, float *out, float *x, const float *residual, const float *weight, const float *ada_scale, int n, int hidden, float eps);
+
+void vox_cuda_silu(vox_cuda_ctx_t *ctx, float *x, int n);
+void vox_cuda_ffn_swiglu(vox_cuda_ctx_t *ctx, float *out, const float *gate, const float *up, int n);
+void vox_cuda_gelu(vox_cuda_ctx_t *ctx, float *x, int n);
+void vox_cuda_add_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n);
+void vox_cuda_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n);
+void vox_cuda_axpy(vox_cuda_ctx_t *ctx, float *a, float scale, const float *b, int n);
+void vox_cuda_bias_add(vox_cuda_ctx_t *ctx, float *y, const float *b, int seq_len, int out_dim);
+void vox_cuda_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, int heads, int head_dim);
+void vox_cuda_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *weight, const float *bias,
                             int channels_in, int channels_out, int length, int out_length,
                             int kernel_size, int stride);
-void vox_cuda_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void vox_cuda_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const float *K, const float *V,
                                int seq_q, int seq_k, int n_heads, int n_kv_heads,
                                int head_dim, float scale, int window_size, int q_offset);
-void vox_cuda_ada_scale(float *x, const float *scale, int n);
-void vox_cuda_transpose_mel(float *out, const float *in, int frames, int bins);
-void vox_cuda_transpose_conv(float *out, const float *in, int seq_len, int dim);
+void vox_cuda_causal_attention_ptr(vox_cuda_ctx_t *ctx, float *out, const float *Q, const float *K, const float *V,
+                                   int seq_q, const int *seq_k_ptr, int n_heads, int n_kv_heads,
+                                   int head_dim, float scale, int window_size, const int *q_offset_ptr);
+void vox_cuda_ada_scale(vox_cuda_ctx_t *ctx, float *x, const float *scale, int n);
+void vox_cuda_transpose_mel(vox_cuda_ctx_t *ctx, float *out, const float *in, int frames, int bins);
+void vox_cuda_transpose_conv(vox_cuda_ctx_t *ctx, float *out, const float *in, int seq_len, int dim);
 
-/* Matrix multiplication using cuBLAS: C = alpha * A * B + beta * C */
-void vox_cuda_sgemm(int m, int n, int k, const float *a, const float *b, float *c);
-void vox_cuda_sgemm_t(int m, int n, int k, const float *a, const float *b, float *c);
-void vox_cuda_matmul_t_bf16(int m, int n, int k, const float *a, const unsigned short *b_bf16, float *c);
+/* Matrix multiplication: C = alpha * A * B + beta * C
+   - sgemm: FP32 * FP32 -> FP32
+   - matmul_bf16: BF16 (A) * BF16 (B) -> FP32 (C)
+*/
+void vox_cuda_sgemm(vox_cuda_ctx_t *ctx, int m, int n, int k, const float *a, const float *b, float *c);
+void vox_cuda_sgemm_t(vox_cuda_ctx_t *ctx, int m, int n, int k, const float *a, const float *b, float *c);
+void vox_cuda_matmul_bf16(vox_cuda_ctx_t *ctx, int m, int n, int k, const void *a, const void *b, float *c, int transpose_b);
 
 #ifdef __cplusplus
 }

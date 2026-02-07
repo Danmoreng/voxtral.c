@@ -155,7 +155,9 @@ if ($CC -eq "gcc") {
     
     if ($Cuda) {
         Write-Host "Compiling CUDA kernels..."
-        $cuCmd = "& `"$NVCC`" -c voxtral_cuda.cu -o voxtral_cuda.obj -O3 -Xcompiler ""/MT /O2"""
+        # Add -arch=sm_80 or higher for BF16 Tensor Core support. 
+        # Using -arch=native if supported by nvcc version, otherwise sm_80 is a safe modern baseline.
+        $cuCmd = "& `"$NVCC`" -c voxtral_cuda.cu -o voxtral_cuda.obj -O3 -arch=sm_80 -Xcompiler ""/MT /O2"""
         Write-Host $cuCmd
         Invoke-Expression $cuCmd
         if ($LASTEXITCODE -ne 0) {
@@ -169,7 +171,7 @@ if ($CC -eq "gcc") {
             $CFLAGS += "/I`"$CUDA_INC_PATH`""
         }
         $SRCS += "voxtral_cuda.obj"
-        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cudart.lib cublas.lib"
+        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cudart.lib cublas.lib cublaslt.lib"
     }
 
     $cmd = "$CC $CFLAGS $SRCS /Fe$TARGET /link $LINK_FLAGS"

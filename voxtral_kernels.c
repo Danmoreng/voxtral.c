@@ -97,10 +97,10 @@ static int avx512bf16_check(void) {
  * Basic Element-wise Operations
  * ======================================================================== */
 
-void vox_add_inplace(float *a, const float *b, int n) {
+void vox_add_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_add_inplace(a, b, n);
+        vox_cuda_add_inplace(ctx, a, b, n);
         return;
     }
 #endif
@@ -117,10 +117,10 @@ void vox_add_inplace(float *a, const float *b, int n) {
     for (; i < n; i++) a[i] += b[i];
 }
 
-void vox_mul_inplace(float *a, const float *b, int n) {
+void vox_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_mul_inplace(a, b, n);
+        vox_cuda_mul_inplace(ctx, a, b, n);
         return;
     }
 #endif
@@ -137,10 +137,10 @@ void vox_mul_inplace(float *a, const float *b, int n) {
     for (; i < n; i++) a[i] *= b[i];
 }
 
-void vox_axpy(float *a, float scale, const float *b, int n) {
+void vox_axpy(vox_cuda_ctx_t *ctx, float *a, float scale, const float *b, int n) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_axpy(a, scale, b, n);
+        vox_cuda_axpy(ctx, a, scale, b, n);
         return;
     }
 #endif
@@ -190,11 +190,11 @@ void vox_copy(float *dst, const float *src, int n) {
 #define BLOCK_N 64
 #define BLOCK_K 64
 
-void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+void vox_matmul(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
         /* cuBLAS handles large matrices efficiently */
-        vox_cuda_sgemm(M, N, K, A, B, C);
+        vox_cuda_sgemm(ctx, M, N, K, A, B, C);
         return;
     }
 #endif
@@ -236,10 +236,10 @@ void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 #endif
 }
 
-void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
+void vox_matmul_t(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_sgemm_t(M, N, K, A, B, C);
+        vox_cuda_sgemm_t(ctx, M, N, K, A, B, C);
         return;
     }
 #endif
@@ -283,8 +283,17 @@ void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N)
 #endif
 }
 
-void vox_linear(float *y, const float *x, const float *W, const float *b,
+void vox_linear(vox_cuda_ctx_t *ctx, float *y, const float *x, const float *W, const float *b,
                 int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_matmul_t(ctx, y, x, W, seq_len, in_dim, out_dim);
+        if (b != NULL) {
+            vox_cuda_bias_add(ctx, y, b, seq_len, out_dim);
+        }
+        return;
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
@@ -314,9 +323,9 @@ void vox_linear(float *y, const float *x, const float *W, const float *b,
 #endif
 }
 
-void vox_linear_nobias(float *y, const float *x, const float *W,
+void vox_linear_nobias(vox_cuda_ctx_t *ctx, float *y, const float *x, const float *W,
                        int seq_len, int in_dim, int out_dim) {
-    vox_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
+    vox_linear(ctx, y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
 /* Convert bf16 buffer to f32 buffer */
@@ -417,11 +426,11 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
     }
 }
 
-void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
+void vox_linear_nobias_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_matmul_t_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
+        vox_cuda_matmul_bf16(ctx, seq_len, out_dim, in_dim, x, W_bf16, y, 1);
         return;
     }
 #endif
@@ -450,16 +459,16 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
     bf16_to_f32_buf(W_f32, W_bf16, n);
-    vox_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+    vox_linear_nobias(ctx, y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
-void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
+void vox_linear_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16_t *W_bf16,
                      const float *b, int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_matmul_t_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
+        vox_cuda_matmul_bf16(ctx, seq_len, out_dim, in_dim, x, W_bf16, y, 1);
         if (b != NULL) {
-            vox_cuda_bias_add(y, b, seq_len, out_dim);
+            vox_cuda_bias_add(ctx, y, b, seq_len, out_dim);
         }
         return;
     }
@@ -506,14 +515,14 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
     bf16_to_f32_buf(W_f32, W_bf16, n);
-    vox_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
+    vox_linear(ctx, y, x, W_f32, b, seq_len, in_dim, out_dim);
 }
 
-void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
+void vox_matmul_t_bf16(vox_cuda_ctx_t *ctx, float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_matmul_t_bf16(M, N, K, A, B_bf16, C);
+        vox_cuda_matmul_bf16(ctx, M, N, K, A, B_bf16, C, 1);
         return;
     }
 #endif
@@ -546,7 +555,7 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
         float *B_f32 = bf16_get_scratch(n);
         if (!B_f32) return;
         bf16_to_f32_buf(B_f32, B_bf16, n);
-        vox_matmul_t(C, A, B_f32, M, K, N);
+        vox_matmul_t(ctx, C, A, B_f32, M, K, N);
     }
 }
 
@@ -554,9 +563,10 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
  * 1D Convolution
  * ======================================================================== */
 
-void vox_conv1d(float *out, const float *in, const float *weight, const float *bias,
+void vox_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *weight, const float *bias,
                 int channels_in, int channels_out, int length,
                 int kernel_size, int stride, int padding) {
+    (void)ctx;
     int out_length = (length + 2 * padding - kernel_size) / stride + 1;
 
     for (int oc = 0; oc < channels_out; oc++) {
@@ -577,7 +587,7 @@ void vox_conv1d(float *out, const float *in, const float *weight, const float *b
     }
 }
 
-void vox_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
+void vox_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *weight, const float *bias,
                        int channels_in, int channels_out, int length,
                        int kernel_size, int stride) {
     /* Matches vLLM WhisperCausalConv1d padding scheme.
@@ -589,7 +599,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
 
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_causal_conv1d(out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
+        vox_cuda_causal_conv1d(ctx, out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
         return;
     }
 #endif
@@ -622,7 +632,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
                 out, out_length);
 #else
     /* Use vox_matmul (which handles AVX2/AVX512/OpenMP) instead of raw loop */
-    vox_matmul(out, weight, im2col, channels_out, K, out_length);
+    vox_matmul(ctx, out, weight, im2col, channels_out, K, out_length);
 #endif
     vox_mem_free(im2col);
 
@@ -641,11 +651,11 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
  * Normalization
  * ======================================================================== */
 
-void vox_rms_norm(float *out, const float *x, const float *weight,
+void vox_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const float *weight,
                   int seq_len, int hidden, float eps) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_rms_norm(out, x, weight, seq_len, hidden, eps);
+        vox_cuda_rms_norm(ctx, out, x, weight, seq_len, hidden, eps);
         return;
     }
 #endif
@@ -742,10 +752,10 @@ static inline __m256 exp256_ps(__m256 x) {
 }
 #endif
 
-void vox_silu(float *x, int n) {
+void vox_silu(vox_cuda_ctx_t *ctx, float *x, int n) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_silu(x, n);
+        vox_cuda_silu(ctx, x, n);
         return;
     }
 #endif
@@ -773,10 +783,10 @@ void vox_silu(float *x, int n) {
     }
 }
 
-void vox_gelu(float *x, int n) {
+void vox_gelu(vox_cuda_ctx_t *ctx, float *x, int n) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_gelu(x, n);
+        vox_cuda_gelu(ctx, x, n);
         return;
     }
 #endif
@@ -851,13 +861,13 @@ void vox_softmax(float *x, int rows, int cols) {
  * Attention Operations
  * ======================================================================== */
 
-void vox_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const float *K, const float *V,
                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
                           int head_dim, float scale, int window_size,
                           int q_offset) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_causal_attention(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
+        vox_cuda_causal_attention(ctx, out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
         return;
     }
 #endif
@@ -949,10 +959,10 @@ void vox_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, floa
     }
 }
 
-void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_dim) {
+void vox_apply_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, int heads, int head_dim) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_rope(x, freqs, seq, heads, head_dim);
+        vox_cuda_rope(ctx, x, freqs, seq, heads, head_dim);
         return;
     }
 #endif

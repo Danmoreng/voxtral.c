@@ -11,13 +11,24 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Forward declarations */
+typedef struct vox_cuda_ctx vox_cuda_ctx_t;
+typedef struct vox_ctx vox_ctx_t;
+
 /* Memory management */
+/* vox_mem_* functions manage memory that MAY be accessed by GPU (managed/unified) */
 void *vox_mem_malloc(size_t size);
 void *vox_mem_calloc(size_t count, size_t size);
 void *vox_mem_realloc(void *ptr, size_t size);
 void vox_mem_free(void *ptr);
 void vox_mem_copy(void *dst, const void *src, size_t size);
 char *vox_strdup(const char *s);
+
+/* vox_*_cpu functions manage standard CPU-only memory */
+void *vox_cpu_malloc(size_t size);
+void *vox_cpu_calloc(size_t count, size_t size);
+void *vox_cpu_realloc(void *ptr, size_t size);
+void vox_cpu_free(void *ptr);
 
 /* ========================================================================
  * Model Constants
@@ -159,7 +170,7 @@ typedef struct {
  * Main Context
  * ======================================================================== */
 
-typedef struct {
+struct vox_ctx {
     vox_encoder_t encoder;
     vox_adapter_t adapter;
     vox_decoder_t decoder;
@@ -206,7 +217,19 @@ typedef struct {
     float *dec_attn_out, *dec_proj_out;
     float *dec_gate, *dec_up, *dec_ffn_out;
     float *dec_rope_freqs;
-} vox_ctx_t;
+
+    /* CUDA context */
+    vox_cuda_ctx_t *cuda_ctx;
+
+    /* CUDA Graph objects */
+    void *cuda_dec_graph_exec;
+    void *cuda_enc_graph_exec;
+    int cuda_dec_graph_captured;
+    int cuda_enc_graph_captured;
+    int *cuda_d_pos;        /* Device-side 'pos' for Graph */
+    int *cuda_d_total_seq;  /* Device-side 'total_seq' for Graph */
+    float *cuda_d_rope;     /* Device-side rope_freqs for Graph */
+};
 
 /* ========================================================================
  * Alternative Tokens
@@ -299,6 +322,12 @@ char *vox_transcribe_stdin(vox_ctx_t *ctx);
 /* ========================================================================
  * Internal Functions (used by encoder/decoder implementations)
  * ======================================================================== */
+
+#include "voxtral_safetensors.h"
+
+int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf);
+int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf);
+int vox_adapter_load(vox_adapter_t *ada, safetensors_file_t *sf);
 
 /* Audio encoder forward pass (full, non-incremental) */
 float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,

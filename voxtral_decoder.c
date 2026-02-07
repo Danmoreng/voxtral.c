@@ -187,6 +187,13 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
     vox_mem_free(ctx->kv_cache_k);
     vox_mem_free(ctx->kv_cache_v);
 #endif
+#ifdef USE_CUDA
+    if (vox_cuda_available() && ctx->cuda_dec_graph_captured) {
+        vox_cuda_graph_destroy(ctx->cuda_dec_graph_exec);
+        ctx->cuda_dec_graph_exec = NULL;
+        ctx->cuda_dec_graph_captured = 0;
+    }
+#endif
     ctx->kv_cache_k = new_k;
     ctx->kv_cache_v = new_v;
     ctx->kv_cache_max = new_max;
@@ -285,7 +292,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         vox_dec_layer_t *l = &dec->layers[layer];
 
         /* ---- Self-attention ---- */
-        vox_rms_norm(x_norm, x, l->attention_norm, seq_len, dim, VOX_DEC_NORM_EPS);
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->attention_norm, seq_len, dim, VOX_DEC_NORM_EPS);
 
         /* Q, K, V projections (no bias in decoder, bf16 weights) */
 #ifdef USE_METAL
@@ -298,14 +305,14 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         } else
 #endif
         {
-            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
-            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
         }
 
         /* Apply RoPE */
-        vox_apply_rope(q, rope_freqs, seq_len, n_heads, head_dim);
-        vox_apply_rope(k, rope_freqs, seq_len, n_kv_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, q, rope_freqs, seq_len, n_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, k, rope_freqs, seq_len, n_kv_heads, head_dim);
 
         /* Store K, V in cache */
         for (int s = 0; s < seq_len; s++) {
@@ -321,16 +328,16 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         float *full_v = kv_cache_v_at(ctx, layer, 0);
 
         float scale = 1.0f / sqrtf((float)head_dim);
-        vox_causal_attention(attn_out, q, full_k, full_v,
+        vox_causal_attention(ctx->cuda_ctx, attn_out, q, full_k, full_v,
                              seq_len, total_seq, n_heads, n_kv_heads,
                              head_dim, scale, VOX_DEC_WINDOW, start_pos);
 
         /* Output projection + residual */
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, seq_len, q_dim, dim);
-        vox_add_inplace(x, proj_out, seq_len * dim);
+        vox_linear_nobias_bf16(ctx->cuda_ctx, proj_out, attn_out, l->wo_weight_bf16, seq_len, q_dim, dim);
+        vox_add_inplace(ctx->cuda_ctx, x, proj_out, seq_len * dim);
 
         /* ---- FFN ---- */
-        vox_rms_norm(x_norm, x, l->ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS);
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS);
 
         /* Time conditioning (ada_rms_norm_t_cond): h_norm *= (1 + ada_scale[layer]) */
         if (ctx->ada_scale) {
@@ -353,16 +360,16 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
             /* CPU path needs separate gate/up buffers */
             float *gate = (float *)vox_mem_malloc(seq_len * hidden * sizeof(float));
             float *up = (float *)vox_mem_malloc(seq_len * hidden * sizeof(float));
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
-            vox_silu(gate, seq_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
-            vox_mul_inplace(gate, up, seq_len * hidden);
-            vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+            vox_silu(ctx->cuda_ctx, gate, seq_len * hidden);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+            vox_mul_inplace(ctx->cuda_ctx, gate, up, seq_len * hidden);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
             vox_mem_free(gate); vox_mem_free(up);
         }
 
         /* Residual */
-        vox_add_inplace(x, ffn_out, seq_len * dim);
+        vox_add_inplace(ctx->cuda_ctx, x, ffn_out, seq_len * dim);
     }
 
     ctx->kv_cache_len = start_pos + seq_len;
@@ -396,6 +403,14 @@ static void ensure_dec_buffers(vox_ctx_t *ctx) {
     ctx->dec_up       = (float *)vox_mem_malloc(hidden * sizeof(float));
     ctx->dec_ffn_out  = (float *)vox_mem_malloc(dim * sizeof(float));
     ctx->dec_rope_freqs = (float *)vox_mem_malloc((head_dim / 2) * 2 * sizeof(float));
+
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        ctx->cuda_d_pos = (int *)vox_cuda_malloc(sizeof(int));
+        ctx->cuda_d_total_seq = (int *)vox_cuda_malloc(sizeof(int));
+        ctx->cuda_d_rope = (float *)vox_cuda_malloc((head_dim / 2) * 2 * sizeof(float));
+    }
+#endif
 }
 
 int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits) {
@@ -444,6 +459,74 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        /* Monolithic CUDA Graph path */
+        int total_seq = pos + 1;
+        vox_cuda_copy_to_device(ctx->cuda_d_pos, &pos, sizeof(int));
+        vox_cuda_copy_to_device(ctx->cuda_d_total_seq, &total_seq, sizeof(int));
+        vox_cuda_copy_to_device(ctx->cuda_d_rope, rope_freqs, (head_dim / 2) * 2 * sizeof(float));
+
+        if (!ctx->cuda_dec_graph_captured) {
+            vox_cuda_graph_begin(ctx->cuda_ctx);
+            for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
+                vox_dec_layer_t *l = &dec->layers[layer];
+                
+                /* Self-attention */
+                vox_cuda_rms_norm(ctx->cuda_ctx, x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, q_dim, dim, x_norm, l->wq_weight_bf16, q, 1);
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, kv_dim, dim, x_norm, l->wk_weight_bf16, k, 1);
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, kv_dim, dim, x_norm, l->wv_weight_bf16, v, 1);
+                vox_cuda_rope(ctx->cuda_ctx, q, ctx->cuda_d_rope, 1, n_heads, head_dim);
+                vox_cuda_rope(ctx->cuda_ctx, k, ctx->cuda_d_rope, 1, n_kv_heads, head_dim);
+                vox_cuda_kv_cache_update(ctx->cuda_ctx, ctx->kv_cache_k, ctx->kv_cache_v, k, v, layer, ctx->cuda_d_pos, ctx->kv_cache_max, kv_dim);
+                
+                vox_cuda_causal_attention_ptr(ctx->cuda_ctx, attn_out, q, ctx->kv_cache_k, ctx->kv_cache_v,
+                                              1, ctx->cuda_d_total_seq, n_heads, n_kv_heads,
+                                              head_dim, scale, VOX_DEC_WINDOW, ctx->cuda_d_pos);
+                
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, dim, q_dim, attn_out, l->wo_weight_bf16, proj_out, 1);
+                vox_cuda_add_inplace(ctx->cuda_ctx, x, proj_out, dim);
+
+                /* FFN */
+                if (ctx->ada_scale) {
+                    const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
+                    vox_cuda_rms_norm_ada_residual(ctx->cuda_ctx, x_norm, x, NULL, l->ffn_norm, ada_s, 1, dim, VOX_DEC_NORM_EPS);
+                } else {
+                    vox_cuda_rms_norm_residual(ctx->cuda_ctx, x_norm, x, NULL, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
+                }
+                
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, hidden, dim, x_norm, l->w1_weight_bf16, gate_buf, 1);
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, hidden, dim, x_norm, l->w3_weight_bf16, up_buf, 1);
+                vox_cuda_ffn_swiglu(ctx->cuda_ctx, gate_buf, gate_buf, up_buf, hidden);
+                vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, dim, hidden, gate_buf, l->w2_weight_bf16, ffn_out, 1);
+                vox_cuda_add_inplace(ctx->cuda_ctx, x, ffn_out, dim);
+            }
+            
+            /* Final norm and logits */
+            vox_cuda_rms_norm(ctx->cuda_ctx, x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, VOX_VOCAB_SIZE, 1, dim, dec->tok_embeddings_bf16, x, logits, 0); 
+            
+            ctx->cuda_dec_graph_exec = vox_cuda_graph_end(ctx->cuda_ctx);
+            ctx->cuda_dec_graph_captured = 1;
+        }
+
+        vox_cuda_graph_exec(ctx->cuda_dec_graph_exec);
+        ctx->kv_cache_len = pos + 1;
+        
+        // Argmax on CPU for now, or implement a CUDA argmax if needed.
+        int best = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
+            if (logits[i] > best_val) {
+                best_val = logits[i];
+                best = i;
+            }
+        }
+        return best;
+    }
+#endif
+
 #ifdef USE_METAL
     if (vox_metal_available()) {
         /* Try monolithic GPU path: all 26 layers + logits in ONE command buffer.
@@ -463,13 +546,22 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
 
-        vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
-        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
-        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
-        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, q_dim, dim, x_norm, l->wq_weight_bf16, q, 1);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, kv_dim, dim, x_norm, l->wk_weight_bf16, k, 1);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, kv_dim, dim, x_norm, l->wv_weight_bf16, v, 1);
+        } else
+#endif
+        {
+            vox_linear_nobias_bf16(ctx->cuda_ctx, q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        }
 
-        vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
-        vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, q, rope_freqs, 1, n_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, k, rope_freqs, 1, n_kv_heads, head_dim);
 
         vox_mem_copy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
         vox_mem_copy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
@@ -478,38 +570,62 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
 
-        vox_causal_attention(attn_out, q, full_k, full_v,
+        vox_causal_attention(ctx->cuda_ctx, attn_out, q, full_k, full_v,
                              1, total_seq, n_heads, n_kv_heads,
                              head_dim, scale, VOX_DEC_WINDOW, pos);
 
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
-        vox_add_inplace(x, proj_out, dim);
-
-        vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
-        if (ctx->ada_scale) {
-            const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
 #ifdef USE_CUDA
-            if (vox_cuda_available()) {
-                vox_cuda_ada_scale(x_norm, ada_s, dim);
-            } else
+        if (vox_cuda_available()) {
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, dim, q_dim, attn_out, l->wo_weight_bf16, proj_out, 1);
+            vox_cuda_add_inplace(ctx->cuda_ctx, x, proj_out, dim);
+        } else
 #endif
-            {
+        {
+            vox_linear_nobias_bf16(ctx->cuda_ctx, proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+            vox_add_inplace(ctx->cuda_ctx, x, proj_out, dim);
+        }
+
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            if (ctx->ada_scale) {
+                const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
+                vox_cuda_rms_norm_ada_residual(ctx->cuda_ctx, x_norm, x, NULL, l->ffn_norm, ada_s, 1, dim, VOX_DEC_NORM_EPS);
+            } else {
+                vox_cuda_rms_norm_residual(ctx->cuda_ctx, x_norm, x, NULL, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
+            }
+        } else
+#endif
+        {
+            vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
+            if (ctx->ada_scale) {
+                const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
                 for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
             }
         }
 
-        vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
-        vox_silu(gate_buf, hidden);
-        vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
-        vox_mul_inplace(gate_buf, up_buf, hidden);
-        vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
-        vox_add_inplace(x, ffn_out, dim);
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, hidden, dim, x_norm, l->w1_weight_bf16, gate_buf, 1);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, hidden, dim, x_norm, l->w3_weight_bf16, up_buf, 1);
+            vox_cuda_ffn_swiglu(ctx->cuda_ctx, gate_buf, gate_buf, up_buf, hidden);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, 1, dim, hidden, gate_buf, l->w2_weight_bf16, ffn_out, 1);
+            vox_cuda_add_inplace(ctx->cuda_ctx, x, ffn_out, dim);
+        } else
+#endif
+        {
+            vox_linear_nobias_bf16(ctx->cuda_ctx, gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
+            vox_silu(ctx->cuda_ctx, gate_buf, hidden);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
+            vox_mul_inplace(ctx->cuda_ctx, gate_buf, up_buf, hidden);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+            vox_add_inplace(ctx->cuda_ctx, x, ffn_out, dim);
+        }
     }
 
     ctx->kv_cache_len = pos + 1;
 
-    vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
-    vox_matmul_t_bf16(logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
+    vox_rms_norm(ctx->cuda_ctx, x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
+    vox_matmul_t_bf16(ctx->cuda_ctx, logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
 
     int best = 0;
     float best_val = logits[0];

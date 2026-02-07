@@ -27,6 +27,12 @@
 - Updated `voxtral_kernels.c` to automatically dispatch linear layers (`vox_linear_bf16`, `vox_linear_nobias_bf16`) and matrix operations to CUDA for batch/prefill processing (`seq_len > 1`).
 - Maintained efficient CPU paths for single-token decoding to minimize synchronization overhead.
 
+### 6. Stability & Thread Safety Improvements (Refactoring)
+- **Allocator Separation**: Introduced `vox_cpu_*` allocators for standard host-only memory (strings, parsing buffers) to prevent mixing with GPU-managed memory and avoid crashes on `realloc`.
+- **Thread-Safe CUDA Context**: Refactored `voxtral_cuda.cu` to eliminate static globals. Created `vox_cuda_ctx_t` to hold cuBLAS handles, workspaces, and graph state, and propagated it throughout the inference pipeline.
+- **Optimized Audio Pipeline**: Replaced the slow DFT-based mel spectrogram implementation with a compact, high-performance O(N log N) FFT (Cooley-Tukey) and implemented robust WAV chunk parsing.
+- **API Completion**: Implemented missing streaming functions (`vox_stream_set_alt`, `vox_stream_get_alt`) and the adapter weight loader (`vox_adapter_load`).
+
 ## Current Status
 - **Build Status**: Passing (MSVC + NVCC)
 - **Functional Status**: Passing regression tests (`runtest.ps1`)

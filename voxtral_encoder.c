@@ -124,8 +124,8 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
  * ======================================================================== */
 
 /* GELU activation */
-static void gelu_inplace(float *x, int n) {
-    vox_gelu(x, n);
+static void gelu_inplace(vox_cuda_ctx_t *ctx, float *x, int n) {
+    vox_gelu(ctx, x, n);
 }
 
 static int causal_conv1d_out_len(int length, int kernel_size, int stride) {
@@ -152,7 +152,12 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     float *conv_in = (float *)vox_mem_malloc(VOX_MEL_BINS * mel_frames * sizeof(float));
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_transpose_mel(conv_in, mel, mel_frames, VOX_MEL_BINS);
+        /* mel is host memory (vox_malloc), but kernels need managed/device memory.
+           Copy to a temporary managed buffer. */
+        float *mel_managed = (float *)vox_mem_malloc(mel_frames * VOX_MEL_BINS * sizeof(float));
+        memcpy(mel_managed, mel, mel_frames * VOX_MEL_BINS * sizeof(float));
+        vox_cuda_transpose_mel(conv_in, mel_managed, mel_frames, VOX_MEL_BINS);
+        vox_mem_free(mel_managed);
     } else
 #endif
     {
@@ -166,17 +171,17 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     /* Conv0: [128, mel_frames] -> [1280, mel_frames] (stride=1, causal) */
     int conv0_out_len = causal_conv1d_out_len(mel_frames, 3, 1);
     float *conv0_out = (float *)vox_mem_malloc(dim * conv0_out_len * sizeof(float));
-    vox_causal_conv1d(conv0_out, conv_in, enc->conv0_weight, enc->conv0_bias,
+    vox_causal_conv1d(ctx->cuda_ctx, conv0_out, conv_in, enc->conv0_weight, enc->conv0_bias,
                       VOX_MEL_BINS, dim, mel_frames, 3, 1);
-    gelu_inplace(conv0_out, dim * conv0_out_len);
+    gelu_inplace(ctx->cuda_ctx, conv0_out, dim * conv0_out_len);
     vox_mem_free(conv_in);
 
     /* Conv1: [1280, mel_frames] -> [1280, ceil(mel_frames/2)] (stride=2, causal) */
     int conv1_out_len = causal_conv1d_out_len(conv0_out_len, 3, 2);
     float *conv1_out = (float *)vox_mem_malloc(dim * conv1_out_len * sizeof(float));
-    vox_causal_conv1d(conv1_out, conv0_out, enc->conv1_weight, enc->conv1_bias,
+    vox_causal_conv1d(ctx->cuda_ctx, conv1_out, conv0_out, enc->conv1_weight, enc->conv1_bias,
                       dim, dim, conv0_out_len, 3, 2);
-    gelu_inplace(conv1_out, dim * conv1_out_len);
+    gelu_inplace(ctx->cuda_ctx, conv1_out, dim * conv1_out_len);
     vox_mem_free(conv0_out);
 
     int seq_len = conv1_out_len;
@@ -221,7 +226,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
         vox_enc_layer_t *l = &enc->layers[layer];
 
         /* ---- Self-attention ---- */
-        vox_rms_norm(x_norm, x, l->attention_norm, seq_len, dim, VOX_ENC_NORM_EPS);
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->attention_norm, seq_len, dim, VOX_ENC_NORM_EPS);
 
         /* Q, K, V projections (bf16 weights, f32 biases) */
 #ifdef USE_METAL
@@ -240,16 +245,16 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
             }
         } else {
 #endif
-            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, seq_len, dim, qkv_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, qkv_dim);
-            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, seq_len, dim, qkv_dim);
+            vox_linear_bf16(ctx->cuda_ctx, q, x_norm, l->wq_weight_bf16, l->wq_bias, seq_len, dim, qkv_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, k, x_norm, l->wk_weight_bf16, seq_len, dim, qkv_dim);
+            vox_linear_bf16(ctx->cuda_ctx, v, x_norm, l->wv_weight_bf16, l->wv_bias, seq_len, dim, qkv_dim);
 #ifdef USE_METAL
         }
 #endif
 
         /* Apply RoPE to Q and K */
-        vox_apply_rope(q, rope_freqs, seq_len, n_heads, head_dim);
-        vox_apply_rope(k, rope_freqs, seq_len, n_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, q, rope_freqs, seq_len, n_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, k, rope_freqs, seq_len, n_heads, head_dim);
 
         /* Causal attention with sliding window */
         float scale = 1.0f / sqrtf((float)head_dim);
@@ -260,7 +265,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                                          head_dim, scale, VOX_ENC_WINDOW, 0);
         } else {
 #endif
-            vox_causal_attention(attn_out, q, k, v,
+            vox_causal_attention(ctx->cuda_ctx, attn_out, q, k, v,
                                  seq_len, seq_len, n_heads, VOX_ENC_KV_HEADS,
                                  head_dim, scale, VOX_ENC_WINDOW, 0);
 #ifdef USE_METAL
@@ -278,14 +283,14 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                     proj_out[s * dim + j] += l->wo_bias[j];
         } else {
 #endif
-            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
+            vox_linear_bf16(ctx->cuda_ctx, proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
 #ifdef USE_METAL
         }
 #endif
-        vox_add_inplace(x, proj_out, seq_len * dim);
+        vox_add_inplace(ctx->cuda_ctx, x, proj_out, seq_len * dim);
 
         /* ---- FFN ---- */
-        vox_rms_norm(x_norm, x, l->ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS);
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS);
 
         /* SwiGLU: gate = silu(w1(x)), up = w3(x), ffn = w2(gate * up) + bias */
 #ifdef USE_METAL
@@ -299,21 +304,21 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                     ffn_out[s * dim + j] += l->w2_bias[j];
         } else {
 #endif
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
-            vox_silu(gate, seq_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
-            vox_mul_inplace(gate, up, seq_len * hidden);
-            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, seq_len, hidden, dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+            vox_silu(ctx->cuda_ctx, gate, seq_len * hidden);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+            vox_mul_inplace(ctx->cuda_ctx, gate, up, seq_len * hidden);
+            vox_linear_bf16(ctx->cuda_ctx, ffn_out, gate, l->w2_weight_bf16, l->w2_bias, seq_len, hidden, dim);
 #ifdef USE_METAL
         }
 #endif
 
         /* Residual */
-        vox_add_inplace(x, ffn_out, seq_len * dim);
+        vox_add_inplace(ctx->cuda_ctx, x, ffn_out, seq_len * dim);
     }
 
     /* Final norm */
-    vox_rms_norm(x, x, enc->norm, seq_len, dim, VOX_ENC_NORM_EPS);
+    vox_rms_norm(ctx->cuda_ctx, x, x, enc->norm, seq_len, dim, VOX_ENC_NORM_EPS);
 
     /* Clean up working buffers */
     vox_mem_free(x_norm); vox_mem_free(q); vox_mem_free(k); vox_mem_free(v);
@@ -533,9 +538,19 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         vox_enc_layer_t *l = &enc->layers[layer];
 
         /* ---- Self-attention ---- */
-        vox_rms_norm(x_norm, x, l->attention_norm, new_len, dim, VOX_ENC_NORM_EPS);
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->attention_norm, new_len, dim, VOX_ENC_NORM_EPS);
 
         /* Q, K, V projections on new positions only */
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, qkv_dim, dim, x_norm, l->wq_weight_bf16, q, 1);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, qkv_dim, dim, x_norm, l->wk_weight_bf16, k, 1);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, qkv_dim, dim, x_norm, l->wv_weight_bf16, v, 1);
+            /* Add biases (wq has bias, wk has NO bias, wv has bias) */
+            vox_cuda_bias_add(ctx->cuda_ctx, q, l->wq_bias, new_len, qkv_dim);
+            vox_cuda_bias_add(ctx->cuda_ctx, v, l->wv_bias, new_len, qkv_dim);
+        } else
+#endif
 #ifdef USE_METAL
         if (vox_metal_available()) {
             vox_metal_fused_qkv_bf16(new_len, dim, x_norm,
@@ -543,7 +558,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                                       l->wk_weight_bf16, qkv_dim,
                                       l->wv_weight_bf16, qkv_dim,
                                       q, k, v);
-            /* Add biases (wq has bias, wk has NO bias, wv has bias) */
+            /* Add biases (wq has bias, wk has NO bias, wv has bias) on CPU */
             for (int s = 0; s < new_len; s++) {
                 for (int j = 0; j < qkv_dim; j++) {
                     q[s * qkv_dim + j] += l->wq_bias[j];
@@ -552,16 +567,16 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             }
         } else {
 #endif
-            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
-            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
+            vox_linear_bf16(ctx->cuda_ctx, q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
+            vox_linear_bf16(ctx->cuda_ctx, v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
 #ifdef USE_METAL
         }
 #endif
 
         /* Apply RoPE to Q and K */
-        vox_apply_rope(q, rope_freqs, new_len, n_heads, head_dim);
-        vox_apply_rope(k, rope_freqs, new_len, n_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, q, rope_freqs, new_len, n_heads, head_dim);
+        vox_apply_rope(ctx->cuda_ctx, k, rope_freqs, new_len, n_heads, head_dim);
 
         /* Copy new K, V into cache */
         vox_mem_copy(enc_kv_cache_k_at(ctx, layer, cache_len), k, (size_t)new_len * qkv_dim * sizeof(float));
@@ -573,21 +588,18 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         float *full_v = enc_kv_cache_v_at(ctx, layer, 0);
         float scale = 1.0f / sqrtf((float)head_dim);
 
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_encoder_attention(attn_out, q, full_k, full_v,
-                                         new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
-                                         head_dim, scale, VOX_ENC_WINDOW, cache_len);
-        } else {
-#endif
-            vox_causal_attention(attn_out, q, full_k, full_v,
-                                 new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
-                                 head_dim, scale, VOX_ENC_WINDOW, cache_len);
-#ifdef USE_METAL
-        }
-#endif
+        vox_causal_attention(ctx->cuda_ctx, attn_out, q, full_k, full_v,
+                             new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
+                             head_dim, scale, VOX_ENC_WINDOW, cache_len);
 
         /* Output projection + residual */
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, dim, qkv_dim, attn_out, l->wo_weight_bf16, proj_out, 1);
+            vox_cuda_bias_add(ctx->cuda_ctx, proj_out, l->wo_bias, new_len, dim);
+            vox_cuda_add_inplace(ctx->cuda_ctx, x, proj_out, new_len * dim);
+        } else
+#endif
 #ifdef USE_METAL
         if (vox_metal_available()) {
             vox_metal_sgemm_bf16(new_len, dim, qkv_dim, attn_out,
@@ -598,15 +610,31 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                     proj_out[s * dim + j] += l->wo_bias[j];
         } else {
 #endif
-            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
+            vox_linear_bf16(ctx->cuda_ctx, proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
 #ifdef USE_METAL
         }
 #endif
-        vox_add_inplace(x, proj_out, new_len * dim);
+        vox_add_inplace(ctx->cuda_ctx, x, proj_out, new_len * dim);
 
         /* ---- FFN ---- */
-        vox_rms_norm(x_norm, x, l->ffn_norm, new_len, dim, VOX_ENC_NORM_EPS);
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            vox_cuda_rms_norm_residual(ctx->cuda_ctx, x_norm, x, NULL, l->ffn_norm, new_len, dim, VOX_ENC_NORM_EPS);
+        } else
+#endif
+        vox_rms_norm(ctx->cuda_ctx, x_norm, x, l->ffn_norm, new_len, dim, VOX_ENC_NORM_EPS);
 
+        /* SwiGLU */
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, hidden, dim, x_norm, l->w1_weight_bf16, gate, 1);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, hidden, dim, x_norm, l->w3_weight_bf16, up, 1);
+            vox_cuda_ffn_swiglu(ctx->cuda_ctx, gate, gate, up, new_len * hidden);
+            vox_cuda_matmul_bf16(ctx->cuda_ctx, new_len, dim, hidden, gate, l->w2_weight_bf16, ffn_out, 1);
+            vox_cuda_bias_add(ctx->cuda_ctx, ffn_out, l->w2_bias, new_len, dim);
+            vox_cuda_add_inplace(ctx->cuda_ctx, x, ffn_out, new_len * dim);
+        } else
+#endif
 #ifdef USE_METAL
         if (vox_metal_available()) {
             vox_metal_fused_ffn_bf16(new_len, dim, hidden, x_norm,
@@ -618,27 +646,44 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                     ffn_out[s * dim + j] += l->w2_bias[j];
         } else {
 #endif
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
-            vox_silu(gate, new_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
-            vox_mul_inplace(gate, up, new_len * hidden);
-            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
+            vox_silu(ctx->cuda_ctx, gate, new_len * hidden);
+            vox_linear_nobias_bf16(ctx->cuda_ctx, up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
+            vox_mul_inplace(ctx->cuda_ctx, gate, up, new_len * hidden);
+            vox_linear_bf16(ctx->cuda_ctx, ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
 #ifdef USE_METAL
         }
 #endif
 
         /* Residual */
-        vox_add_inplace(x, ffn_out, new_len * dim);
+        vox_add_inplace(ctx->cuda_ctx, x, ffn_out, new_len * dim);
     }
 
     /* Final norm */
-    vox_rms_norm(x, x, enc->norm, new_len, dim, VOX_ENC_NORM_EPS);
+    vox_rms_norm(ctx->cuda_ctx, x, x, enc->norm, new_len, dim, VOX_ENC_NORM_EPS);
 
     /* Update cache length */
     ctx->enc_kv_cache_len = cache_len + new_len;
 
     *out_len = new_len;
     return x;
+}
+
+/* ========================================================================
+ * Adapter Weight Loading
+ * ======================================================================== */
+
+int vox_adapter_load(vox_adapter_t *ada, safetensors_file_t *sf) {
+    char name[512];
+    const char *ap = "mm_streams_embeddings.embedding_module.whisper_to_llm_adapter";
+
+    snprintf(name, sizeof(name), "%s.linear0.weight", ap);
+    ada->linear0_weight_bf16 = load_bf16_direct(sf, name);
+    snprintf(name, sizeof(name), "%s.linear1.weight", ap);
+    ada->linear1_weight_bf16 = load_bf16_direct(sf, name);
+
+    if (!ada->linear0_weight_bf16 || !ada->linear1_weight_bf16) return -1;
+    return 0;
 }
 
 /* ========================================================================
@@ -666,11 +711,11 @@ float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,
 
     /* Linear(5120 -> 3072) -> GELU -> Linear(3072 -> 3072) */
     float *mid = (float *)vox_mem_malloc(ds_len * VOX_DEC_DIM * sizeof(float));
-    vox_linear_nobias_bf16(mid, ds, ctx->adapter.linear0_weight_bf16, ds_len, ds_dim, VOX_DEC_DIM);
-    vox_gelu(mid, ds_len * VOX_DEC_DIM);
+    vox_linear_nobias_bf16(ctx->cuda_ctx, mid, ds, ctx->adapter.linear0_weight_bf16, ds_len, ds_dim, VOX_DEC_DIM);
+    vox_gelu(ctx->cuda_ctx, mid, ds_len * VOX_DEC_DIM);
 
     float *out = (float *)vox_mem_malloc(ds_len * VOX_DEC_DIM * sizeof(float));
-    vox_linear_nobias_bf16(out, mid, ctx->adapter.linear1_weight_bf16, ds_len, VOX_DEC_DIM, VOX_DEC_DIM);
+    vox_linear_nobias_bf16(ctx->cuda_ctx, out, mid, ctx->adapter.linear1_weight_bf16, ds_len, VOX_DEC_DIM, VOX_DEC_DIM);
 
     vox_mem_free(ds);
     vox_mem_free(mid);
