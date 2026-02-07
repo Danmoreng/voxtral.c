@@ -81,20 +81,45 @@ void vox_copy(float *dst, const float *src, int n) {
  * Matrix Operations
  * ======================================================================== */
 
+/* Block size for tiling - tuned for L1/L2 cache */
+#define BLOCK_M 64
+#define BLOCK_N 64
+#define BLOCK_K 64
+
 void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
 #else
-    int m, n, k;
-    #pragma omp parallel for private(n, k)
+    int m, n;
+    /* Initialize C to zero */
+    #pragma omp parallel for private(n)
     for (m = 0; m < M; m++) {
         for (n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[k * N + n];
+            C[m * N + n] = 0.0f;
+        }
+    }
+
+    /* Tiled matrix multiplication */
+    int m0, n0;
+    #pragma omp parallel for private(n0) schedule(dynamic)
+    for (m0 = 0; m0 < M; m0 += BLOCK_M) {
+        for (n0 = 0; n0 < N; n0 += BLOCK_N) {
+            int m_end = (m0 + BLOCK_M < M) ? m0 + BLOCK_M : M;
+            int n_end = (n0 + BLOCK_N < N) ? n0 + BLOCK_N : N;
+
+            for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+                int k_end = (k0 + BLOCK_K < K) ? k0 + BLOCK_K : K;
+
+                for (int m = m0; m < m_end; m++) {
+                    for (int k = k0; k < k_end; k++) {
+                        float a_val = A[m * K + k];
+                        for (int n = n0; n < n_end; n++) {
+                            C[m * N + n] += a_val * B[k * N + n];
+                        }
+                    }
+                }
             }
-            C[m * N + n] = sum;
         }
     }
 #endif
@@ -105,15 +130,37 @@ void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    int m, n, k;
-    #pragma omp parallel for private(n, k)
+    int m, n;
+    /* Initialize C to zero */
+    #pragma omp parallel for private(n)
     for (m = 0; m < M; m++) {
         for (n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
+            C[m * N + n] = 0.0f;
+        }
+    }
+
+    int m0, n0;
+    /* Tiled matrix multiplication (B is transposed: B[n][k]) */
+    #pragma omp parallel for private(n0) schedule(dynamic)
+    for (m0 = 0; m0 < M; m0 += BLOCK_M) {
+        for (n0 = 0; n0 < N; n0 += BLOCK_N) {
+            int m_end = (m0 + BLOCK_M < M) ? m0 + BLOCK_M : M;
+            int n_end = (n0 + BLOCK_N < N) ? n0 + BLOCK_N : N;
+            
+            /* Process all k blocks for this m,n block */
+            for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+                int k_end = (k0 + BLOCK_K < K) ? k0 + BLOCK_K : K;
+                
+                for (int m = m0; m < m_end; m++) {
+                    for (int n = n0; n < n_end; n++) {
+                        float sum = 0.0f;
+                        for (int k = k0; k < k_end; k++) {
+                            sum += A[m * K + k] * B[n * K + k];
+                        }
+                        C[m * N + n] += sum;
+                    }
+                }
             }
-            C[m * N + n] = sum;
         }
     }
 #endif
