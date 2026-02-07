@@ -56,10 +56,12 @@ void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
 #else
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
+    int m, n, k;
+    #pragma omp parallel for private(n, k)
+    for (m = 0; m < M; m++) {
+        for (n = 0; n < N; n++) {
             float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
+            for (k = 0; k < K; k++) {
                 sum += A[m * K + k] * B[k * N + n];
             }
             C[m * N + n] = sum;
@@ -73,10 +75,12 @@ void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
+    int m, n, k;
+    #pragma omp parallel for private(n, k)
+    for (m = 0; m < M; m++) {
+        for (n = 0; n < N; n++) {
             float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
+            for (k = 0; k < K; k++) {
                 sum += A[m * K + k] * B[n * K + k];
             }
             C[m * N + n] = sum;
@@ -100,16 +104,17 @@ void vox_linear(float *y, const float *x, const float *W, const float *b,
         }
     }
 #else
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * in_dim;
-        float *y_row = y + s * out_dim;
-        for (int o = 0; o < out_dim; o++) {
+    int s, o, i;
+    #pragma omp parallel for private(o, i)
+    for (s = 0; s < seq_len; s++) {
+        for (o = 0; o < out_dim; o++) {
+            const float *x_row = x + s * in_dim;
             const float *w_row = W + o * in_dim;
             float sum = (b != NULL) ? b[o] : 0.0f;
-            for (int i = 0; i < in_dim; i++) {
+            for (i = 0; i < in_dim; i++) {
                 sum += x_row[i] * w_row[i];
             }
-            y_row[o] = sum;
+            y[s * out_dim + o] = sum;
         }
     }
 #endif
@@ -153,7 +158,9 @@ static float *bf16_get_scratch(size_t n) {
 
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
-    for (int o = 0; o < out_dim; o++) {
+    int o;
+    #pragma omp parallel for private(o)
+    for (o = 0; o < out_dim; o++) {
         const uint16_t *w_row = W_bf16 + (size_t)o * in_dim;
         float sum = bias ? bias[o] : 0.0f;
         int k = 0;
@@ -319,6 +326,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
     }
 
     /* out = weight × im2col: [channels_out, K] × [K, out_length] → [channels_out, out_length] */
+#ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 channels_out, out_length, K,
                 1.0f,
@@ -326,6 +334,21 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
                 im2col, out_length,
                 0.0f,
                 out, out_length);
+#else
+    int oc, ol, k;
+    #pragma omp parallel for private(ol, k)
+    for (oc = 0; oc < channels_out; oc++) {
+        float *out_row = out + (size_t)oc * out_length;
+        const float *w_row = weight + (size_t)oc * K;
+        for (ol = 0; ol < out_length; ol++) {
+            float sum = 0.0f;
+            for (k = 0; k < K; k++) {
+                sum += w_row[k] * im2col[(size_t)k * out_length + ol];
+            }
+            out_row[ol] = sum;
+        }
+    }
+#endif
     free(im2col);
 
     /* Add bias */
@@ -417,8 +440,10 @@ void vox_causal_attention(float *out, const float *Q, const float *K, const floa
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
-    /* Process each query head */
-    for (int h = 0; h < n_heads; h++) {
+    /* Process each query head in parallel */
+    int h;
+    #pragma omp parallel for private(h)
+    for (h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_kv;  /* GQA: map query head to KV head */
 
         for (int i = 0; i < seq_q; i++) {
@@ -507,11 +532,13 @@ void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_d
     int half_dim = head_dim / 2;
     int hidden = heads * head_dim;
 
-    for (int s = 0; s < seq; s++) {
-        for (int h = 0; h < heads; h++) {
+    int s, h, d;
+    #pragma omp parallel for private(h, d)
+    for (s = 0; s < seq; s++) {
+        for (h = 0; h < heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-            for (int d = 0; d < half_dim; d++) {
+            for (d = 0; d < half_dim; d++) {
                 float cos_val = freqs[s * half_dim * 2 + d * 2];
                 float sin_val = freqs[s * half_dim * 2 + d * 2 + 1];
 

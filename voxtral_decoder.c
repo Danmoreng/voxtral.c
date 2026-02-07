@@ -360,9 +360,6 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
         /* Residual */
         vox_add_inplace(x, ffn_out, seq_len * dim);
-
-        if (vox_verbose >= 2 && ((layer + 1) % 8 == 0 || layer == VOX_DEC_LAYERS - 1))
-            fprintf(stderr, "  Decoder prefill layer %d/%d\n", layer + 1, VOX_DEC_LAYERS);
     }
 
     ctx->kv_cache_len = start_pos + seq_len;

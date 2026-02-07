@@ -14,24 +14,31 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 
 ## Quick Start
 
+### macOS / Linux
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
+# or: make cpu     # Pure C, no dependencies (slower)
 
 # Download the model (~8.9GB)
 ./download_model.sh
 
-# Transcribe audio (tokens stream to stdout as generated)
+# Transcribe audio
 ./voxtral -d voxtral-model -i audio.wav
+```
 
-# Pipe any format via ffmpeg
-ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
-    ./voxtral -d voxtral-model --stdin
+### Windows
+```powershell
+# Build (requires Visual Studio Build Tools or MinGW-w64)
+# Build script will try to find cl.exe or gcc.exe
+.\build.ps1
 
-# Real-time streaming with low latency
-ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
-    ./voxtral -d voxtral-model --stdin -I 0.5
+# Download the model (~8.9GB)
+.\download_model.ps1
+
+# Transcribe audio
+.\voxtral.exe -d voxtral-model -i audio.wav
 ```
 
 That's it. No Python runtime, no CUDA toolkit, no `mistral_common` or vLLM required at inference time.
@@ -226,12 +233,14 @@ Choose a backend when building:
 make            # Show available backends
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+make cpu        # Pure C, no dependencies (slower)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
 - Linux with OpenBLAS: `make blas`
+- Windows: `.\build.ps1`
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -254,7 +263,9 @@ make inspect    # Build safetensors weight inspector
 Download model weights (~8.9GB) from HuggingFace:
 
 ```bash
-./download_model.sh
+./download_model.sh   # macOS / Linux
+# or
+.\download_model.ps1  # Windows
 ```
 
 This downloads to `./voxtral-model/` containing:

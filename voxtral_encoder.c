@@ -293,9 +293,6 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
         /* Residual */
         vox_add_inplace(x, ffn_out, seq_len * dim);
-
-        if (vox_verbose >= 2 && ((layer + 1) % 8 == 0 || layer == VOX_ENC_LAYERS - 1))
-            fprintf(stderr, "  Encoder layer %d/%d\n", layer + 1, VOX_ENC_LAYERS);
     }
 
     /* Final norm */
@@ -620,9 +617,6 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 
         /* Residual */
         vox_add_inplace(x, ffn_out, new_len * dim);
-
-        if (vox_verbose >= 2 && ((layer + 1) % 8 == 0 || layer == VOX_ENC_LAYERS - 1))
-            fprintf(stderr, "  Encoder inc layer %d/%d\n", layer + 1, VOX_ENC_LAYERS);
     }
 
     /* Final norm */

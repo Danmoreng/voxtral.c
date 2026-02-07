@@ -6,8 +6,17 @@ CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
 LDFLAGS = -lm
 
 # Platform detection
-UNAME_S := $(shell uname -s)
-UNAME_M := $(shell uname -m)
+ifeq ($(OS),Windows_NT)
+    UNAME_S := Windows
+    UNAME_M := x86_64
+    TARGET = voxtral.exe
+    CLEAN_CMD = rm -f
+else
+    UNAME_S := $(shell uname -s)
+    UNAME_M := $(shell uname -m)
+    TARGET = voxtral
+    CLEAN_CMD = rm -f
+endif
 
 # Source files
 SRCS = voxtral.c voxtral_kernels.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c voxtral_tokenizer.c voxtral_safetensors.c
@@ -28,6 +37,7 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make cpu      - Pure C, no dependencies (slower)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -43,14 +53,27 @@ endif
 	@echo "Example: make blas && ./voxtral -d voxtral-model -i audio.wav"
 
 # =============================================================================
-# Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
+# Backend: cpu (Pure C, no dependencies)
+# =============================================================================
+cpu: CFLAGS = $(CFLAGS_BASE)
+cpu: clean $(TARGET)
+	@echo ""
+	@echo "Built with CPU-only (no BLAS) backend"
+
+# =============================================================================
+# Backend: blas (Accelerate on macOS, OpenBLAS on Linux/Windows)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
 else
+ifeq ($(UNAME_S),Windows)
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS
+blas: LDFLAGS += -lopenblas
+else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 blas: LDFLAGS += -lopenblas
+endif
 endif
 blas: clean $(TARGET)
 	@echo ""
@@ -124,8 +147,8 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
-	rm -f voxtral_shaders_source.h
+	$(CLEAN_CMD) $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	$(CLEAN_CMD) voxtral_shaders_source.h
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"

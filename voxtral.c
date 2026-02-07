@@ -18,7 +18,25 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+static double get_time_ms(void) {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+#else
 #include <sys/time.h>
+static double get_time_ms(void) {
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return (double)t.tv_sec * 1000.0 + (double)t.tv_usec / 1000.0;
+}
+#endif
 
 /* Global verbose flag */
 int vox_verbose = 0;
@@ -676,8 +694,7 @@ static void stream_run_encoder(vox_stream_t *s) {
     if (new_mel < need_mel && !s->finished) return;
     if (new_mel <= 0) return;
 
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    double t0 = get_time_ms();
 
     /* 1. Run incremental conv stem on new mel -> post-conv positions */
     int conv_out_len = 0;
@@ -764,9 +781,7 @@ static void stream_run_encoder(vox_stream_t *s) {
 
     free(enc_out);
 
-    gettimeofday(&t1, NULL);
-    s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                     (t1.tv_usec - t0.tv_usec) / 1000.0;
+    s->encoder_ms += get_time_ms() - t0;
 
     if (vox_verbose >= 2)
         fprintf(stderr, "  Encoder inc: %d mel -> %d conv -> %d usable (total adapter: %d, residual: %d)\n",
@@ -834,14 +849,13 @@ static void stream_fill_alts(vox_stream_t *s, int best_token,
 
 /* Run decoder: prefill if needed, then generate tokens while adapter available */
 static void stream_run_decoder(vox_stream_t *s) {
-    struct timeval t0, t1;
     int dim = VOX_DEC_DIM;
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
 
     /* Prefill when we have enough adapter tokens */
     if (!s->decoder_started && s->total_adapter >= prompt_len) {
-        gettimeofday(&t0, NULL);
+        double t0 = get_time_ms();
 
         float *prompt_embeds = (float *)malloc((size_t)prompt_len * dim * sizeof(float));
         if (!prompt_embeds) return;
@@ -879,9 +893,7 @@ static void stream_run_decoder(vox_stream_t *s) {
         s->gen_pos = prompt_len;
         s->decoder_started = 1;
 
-        gettimeofday(&t1, NULL);
-        double pf_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                       (t1.tv_usec - t0.tv_usec) / 1000.0;
+        double pf_ms = get_time_ms() - t0;
         s->decoder_ms += pf_ms;
         s->prefill_ms += pf_ms;
 
@@ -892,7 +904,7 @@ static void stream_run_decoder(vox_stream_t *s) {
 
     /* Generate tokens while adapter tokens are available */
     if (s->decoder_started && !s->eos_seen) {
-        gettimeofday(&t0, NULL);
+        double t0 = get_time_ms();
         int gen_before = s->n_generated;
         while (s->gen_pos < s->total_adapter) {
             tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
@@ -913,9 +925,7 @@ static void stream_run_decoder(vox_stream_t *s) {
             if (s->prev_token == TOKEN_EOS) { s->eos_seen = 1; break; }
         }
         if (s->n_generated > gen_before) {
-            gettimeofday(&t1, NULL);
-            s->decoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+            s->decoder_ms += get_time_ms() - t0;
         }
     }
 }
@@ -974,6 +984,10 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
 
     stream_run_encoder(s);
     stream_run_decoder(s);
+
+    if (vox_verbose >= 2) {
+        fprintf(stderr, "[DEBUG] Processed: %.2f seconds\n", (float)s->real_samples_fed / VOX_SAMPLE_RATE);
+    }
     return 0;
 }
 
@@ -1009,6 +1023,10 @@ int vox_stream_finish(vox_stream_t *s) {
     /* Process remaining encoder chunks and generate remaining tokens */
     stream_run_encoder(s);
     stream_run_decoder(s);
+
+    if (vox_verbose >= 2) {
+        fprintf(stderr, "[DEBUG] Processed (final): %.2f seconds\n", (float)s->real_samples_fed / VOX_SAMPLE_RATE);
+    }
     return 0;
 }
 
@@ -1117,6 +1135,9 @@ char *vox_transcribe_audio(vox_ctx_t *ctx, const float *samples, int n_samples) 
 }
 
 char *vox_transcribe_stdin(vox_ctx_t *ctx) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
     /* Read first 4 bytes to detect format */
     uint8_t header[4];
     size_t hdr_read = fread(header, 1, 4, stdin);

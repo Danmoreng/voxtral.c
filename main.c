@@ -14,6 +14,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
 static void usage(const char *prog) {
@@ -108,6 +113,9 @@ static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples)
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
     const char *model_dir = NULL;
     const char *input_wav = NULL;
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
