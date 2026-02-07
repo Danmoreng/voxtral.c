@@ -85,6 +85,10 @@ static int avx512bf16_check(void) {
 }
 #endif
 
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
+
 /* Minimum matrix size to use GPU */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
@@ -93,6 +97,12 @@ static int avx512bf16_check(void) {
  * ======================================================================== */
 
 void vox_add_inplace(float *a, const float *b, int n) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_add_inplace(a, b, n);
+        return;
+    }
+#endif
     int i = 0;
 #if defined(USE_AVX512BF16)
     for (; i <= n - 16; i += 16) {
@@ -107,6 +117,12 @@ void vox_add_inplace(float *a, const float *b, int n) {
 }
 
 void vox_mul_inplace(float *a, const float *b, int n) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_mul_inplace(a, b, n);
+        return;
+    }
+#endif
     int i = 0;
 #if defined(USE_AVX512BF16)
     for (; i <= n - 16; i += 16) {
@@ -122,6 +138,7 @@ void vox_mul_inplace(float *a, const float *b, int n) {
 
 void vox_axpy(float *a, float scale, const float *b, int n) {
     int i = 0;
+    /* TODO: CUDA axpy kernel */
 #if defined(USE_AVX512BF16)
     __m512 s512 = _mm512_set1_ps(scale);
     for (; i <= n - 16; i += 16) {
@@ -137,6 +154,7 @@ void vox_axpy(float *a, float scale, const float *b, int n) {
 }
 
 void vox_scale(float *x, float s, int n) {
+    /* TODO: CUDA scale kernel */
     int i = 0;
 #if defined(USE_AVX512BF16)
     __m512 s_vec512 = _mm512_set1_ps(s);
@@ -166,6 +184,13 @@ void vox_copy(float *dst, const float *src, int n) {
 #define BLOCK_K 64
 
 void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        /* cuBLAS handles large matrices efficiently */
+        vox_cuda_sgemm(M, N, K, A, B, C);
+        return;
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
@@ -578,6 +603,12 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
 
 void vox_rms_norm(float *out, const float *x, const float *weight,
                   int seq_len, int hidden, float eps) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_rms_norm(out, x, weight, seq_len, hidden, eps);
+        return;
+    }
+#endif
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;

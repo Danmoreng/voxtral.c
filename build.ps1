@@ -3,7 +3,8 @@ param(
     [switch]$Clean,
     [switch]$Blas,
     [switch]$Debug,
-    [switch]$Avx512
+    [switch]$Avx512,
+    [switch]$Cuda
 )
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,36 @@ if (-not $CC) {
 
 Write-Host "Using compiler: $CC"
 
+# Helper for CUDA detection
+$NVCC = ""
+$CUDA_LIB_PATH = ""
+if ($Cuda) {
+    if (Test-Command nvcc) {
+        $NVCC = "nvcc"
+    } elseif ($env:CUDA_PATH) {
+        $nvccPath = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
+        if (Test-Path $nvccPath) {
+            $NVCC = $nvccPath
+        }
+    }
+    
+    if (-not $NVCC) {
+        Write-Error "CUDA requested but nvcc not found. Please install CUDA Toolkit."
+        exit 1
+    }
+    
+    if ($env:CUDA_PATH) {
+        $CUDA_LIB_PATH = Join-Path $env:CUDA_PATH "lib\x64"
+    } else {
+        # Try default location
+        $CUDA_LIB_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\lib\x64" # Adjust version if needed logic
+        if (-not (Test-Path $CUDA_LIB_PATH)) {
+             Write-Warning "Could not guess CUDA lib path. Linking might fail."
+        }
+    }
+    Write-Host "Using NVCC: $NVCC"
+}
+
 if ($CC -eq "gcc") {
     $CFLAGS = "-Wall", "-Wextra", "-O3", "-march=native", "-ffast-math", "-mavx2", "-mfma"
     $LDFLAGS = "-lm"
@@ -95,26 +126,49 @@ if ($CC -eq "gcc") {
         $CFLAGS += "-DUSE_BLAS", "-DUSE_OPENBLAS"
         $LDFLAGS += "-lopenblas"
     }
+    if ($Cuda) {
+        Write-Error "CUDA build with gcc on Windows is not implemented in this script (requires complex linking). Please use MSVC."
+        exit 1
+    }
     $cmd = "$CC $CFLAGS -o $TARGET $SRCS $LDFLAGS"
 } else {
     # MSVC (cl.exe)
     # /O2: Optimization, /W3: Warning level, /MT: Static CRT, /D_CRT_SECURE_NO_WARNINGS, /openmp: Enable OpenMP, /arch:AVX2: Enable AVX2
     $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
+    $LINK_FLAGS = ""
+    
     if ($Debug) {
         $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
+        $LINK_FLAGS += "/DEBUG"
     }
+    
     if ($Avx512) {
         # Note: /arch:AVX512 is available in VS 2017 15.3+
         $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX512", "/DUSE_AVX512BF16"
     }
+    
     if ($Blas) {
         $CFLAGS += "/DUSE_BLAS", "/DUSE_OPENBLAS"
         Write-Warning "BLAS support with MSVC in this script is experimental (expects openblas.lib in search path)."
-        $LDFLAGS = "openblas.lib"
-    } else {
-        $LDFLAGS = ""
+        $LINK_FLAGS += " openblas.lib"
     }
-    $cmd = "$CC $CFLAGS $SRCS /Fe$TARGET /link $LDFLAGS"
+    
+    if ($Cuda) {
+        Write-Host "Compiling CUDA kernels..."
+        $cuCmd = "& `"$NVCC`" -c voxtral_cuda.cu -o voxtral_cuda.obj -O3 -Xcompiler ""/MT /O2"""
+        Write-Host $cuCmd
+        Invoke-Expression $cuCmd
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "CUDA compilation failed."
+            exit 1
+        }
+        
+        $CFLAGS += "/DUSE_CUDA"
+        $SRCS += "voxtral_cuda.obj"
+        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cudart.lib cublas.lib"
+    }
+
+    $cmd = "$CC $CFLAGS $SRCS /Fe$TARGET /link $LINK_FLAGS"
 }
 
 Write-Host "Building $TARGET..."
