@@ -11,6 +11,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Memory management */
+void *vox_mem_malloc(size_t size);
+void *vox_mem_calloc(size_t count, size_t size);
+void *vox_mem_realloc(void *ptr, size_t size);
+void vox_mem_free(void *ptr);
+
 /* ========================================================================
  * Model Constants
  * ======================================================================== */

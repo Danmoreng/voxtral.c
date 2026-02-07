@@ -40,11 +40,12 @@ typedef struct {
 /* Safetensors file handle */
 typedef struct {
     char *path;
-    void *data;              /* mmap'd file data */
+    void *data;              /* mmap'd file data or allocated buffer */
     size_t file_size;
     size_t header_size;
     char *header_json;
     int num_tensors;
+    int is_mmap;             /* 1 if mmap, 0 if allocated */
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS];
 } safetensors_file_t;
 

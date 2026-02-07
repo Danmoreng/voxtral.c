@@ -17,6 +17,9 @@ void vox_cuda_init(void);
 /* Shutdown CUDA and free resources */
 void vox_cuda_shutdown(void);
 
+/* Managed Memory (Unified) */
+void *vox_cuda_malloc_managed(size_t size);
+
 /* Allocate shared memory (accessible by both Host and Device) if unified memory is used, 
    or just device memory. For now, mirroring metal's interface might change. */
 void *vox_cuda_malloc(size_t size);
@@ -35,6 +38,8 @@ void vox_cuda_mul_inplace(float *a, const float *b, int n);
 
 /* Matrix multiplication using cuBLAS: C = alpha * A * B + beta * C */
 void vox_cuda_sgemm(int m, int n, int k, const float *a, const float *b, float *c);
+void vox_cuda_sgemm_t(int m, int n, int k, const float *a, const float *b, float *c);
+void vox_cuda_matmul_t_bf16(int m, int n, int k, const float *a, const unsigned short *b_bf16, float *c);
 
 #ifdef __cplusplus
 }

@@ -4,6 +4,10 @@
  */
 
 #include "voxtral_safetensors.h"
+#include "voxtral.h"
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +24,7 @@
 #define fstat _fstat64
 #define stat _stat64
 #define O_RDONLY _O_RDONLY
+#define O_BINARY _O_BINARY
 #define MAP_FAILED NULL
 #else
 #include <unistd.h>
@@ -217,7 +222,55 @@ static int parse_header(safetensors_file_t *sf) {
 }
 
 safetensors_file_t *safetensors_open(const char *path) {
-    int fd = open(path, O_RDONLY);
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { perror("safetensors_open: fopen failed"); return NULL; }
+#ifdef _WIN32
+        _fseeki64(fp, 0, SEEK_END);
+        size_t file_size = (size_t)_ftelli64(fp);
+        _fseeki64(fp, 0, SEEK_SET);
+#else
+        fseeko(fp, 0, SEEK_END);
+        size_t file_size = (size_t)ftello(fp);
+        fseeko(fp, 0, SEEK_SET);
+#endif
+        if (file_size < 8) { fclose(fp); return NULL; }
+
+        void *data = vox_mem_malloc(file_size);
+        if (!data) { fclose(fp); return NULL; }
+
+        size_t n = fread(data, 1, file_size, fp);
+        if (n != file_size) {
+            fprintf(stderr, "safetensors_open: fread short %zu vs %zu\n", n, file_size);
+            vox_mem_free(data); fclose(fp); return NULL;
+        }
+        fclose(fp);
+
+        /* Parse Header Size */
+        uint64_t header_size = 0;
+        memcpy(&header_size, data, 8);
+        
+        safetensors_file_t *sf = vox_mem_calloc(1, sizeof(safetensors_file_t));
+        sf->path = strdup(path);
+        sf->data = data;
+        sf->file_size = file_size;
+        sf->header_size = (size_t)header_size;
+        sf->is_mmap = 0;
+
+        sf->header_json = vox_mem_malloc(header_size + 1);
+        memcpy(sf->header_json, (char*)data + 8, header_size);
+        sf->header_json[header_size] = '\0';
+
+        if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
+        return sf;
+    }
+#endif
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+    int fd = open(path, O_RDONLY | O_BINARY);
     if (fd < 0) {
         perror("safetensors_open: open failed");
         return NULL;
@@ -238,30 +291,63 @@ safetensors_file_t *safetensors_open(const char *path) {
     }
 
     void *data = NULL;
-#ifdef _WIN32
-    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
-    HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (hMapping == NULL) {
-        perror("safetensors_open: CreateFileMapping failed");
-        close(fd);
-        return NULL;
-    }
-    data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-    CloseHandle(hMapping); /* MapViewOfFile keeps a reference */
-    if (data == NULL) {
-        perror("safetensors_open: MapViewOfFile failed");
-        close(fd);
-        return NULL;
-    }
-#else
-    data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-#endif
-    close(fd);
+    int use_mmap = 1;
 
-    if (data == MAP_FAILED) {
-        perror("safetensors_open: mmap failed");
-        return NULL;
+#ifdef USE_CUDA
+    if (vox_cuda_available()) use_mmap = 0;
+#endif
+
+    if (!use_mmap) {
+        data = vox_mem_malloc(file_size);
+        if (!data) {
+            fprintf(stderr, "safetensors_open: failed to allocate %zu bytes for weights\n", file_size);
+            close(fd);
+            return NULL;
+        }
+        /* Read entire file */
+        size_t total_read = 0;
+        char *ptr = (char *)data;
+        while (total_read < file_size) {
+            unsigned int chunk = (unsigned int)(file_size - total_read);
+            /* Windows read uses unsigned int, Linux uses size_t but accepts smaller */
+            if (chunk > 64*1024*1024) chunk = 64*1024*1024;
+            
+            int r = read(fd, ptr + total_read, chunk);
+            if (r <= 0) {
+                perror("safetensors_open: read failed");
+                fprintf(stderr, "read returned %d, total_read=%zu, expected=%zu\n", r, total_read, file_size);
+                vox_mem_free(data);
+                close(fd);
+                return NULL;
+            }
+            total_read += r;
+        }
+    } else {
+#ifdef _WIN32
+        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+        HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (hMapping == NULL) {
+            perror("safetensors_open: CreateFileMapping failed");
+            close(fd);
+            return NULL;
+        }
+        data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(hMapping); /* MapViewOfFile keeps a reference */
+        if (data == NULL) {
+            perror("safetensors_open: MapViewOfFile failed");
+            close(fd);
+            return NULL;
+        }
+#else
+        data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+#endif
+        if (data == MAP_FAILED) {
+            perror("safetensors_open: mmap failed");
+            close(fd);
+            return NULL;
+        }
     }
+    close(fd);
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
@@ -269,21 +355,27 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (header_size > file_size - 8) {
         fprintf(stderr, "safetensors_open: invalid header size\n");
+        if (!use_mmap) vox_mem_free(data);
+        else {
 #ifdef _WIN32
         UnmapViewOfFile(data);
 #else
         munmap(data, file_size);
 #endif
+        }
         return NULL;
     }
 
-    safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
+    safetensors_file_t *sf = vox_mem_calloc(1, sizeof(safetensors_file_t));
     if (!sf) {
+        if (!use_mmap) vox_mem_free(data);
+        else {
 #ifdef _WIN32
         UnmapViewOfFile(data);
 #else
         munmap(data, file_size);
 #endif
+        }
         return NULL;
     }
 
@@ -291,9 +383,10 @@ safetensors_file_t *safetensors_open(const char *path) {
     sf->data = data;
     sf->file_size = file_size;
     sf->header_size = (size_t)header_size;
+    sf->is_mmap = use_mmap;
 
     /* Copy header JSON for parsing */
-    sf->header_json = malloc(header_size + 1);
+    sf->header_json = vox_mem_malloc(header_size + 1);
     if (!sf->header_json) {
         safetensors_close(sf);
         return NULL;
@@ -327,15 +420,19 @@ safetensors_file_t *safetensors_open(const char *path) {
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
     if (sf->data) {
+        if (sf->is_mmap) {
 #ifdef _WIN32
-        UnmapViewOfFile(sf->data);
+            UnmapViewOfFile(sf->data);
 #else
-        munmap(sf->data, sf->file_size);
+            munmap(sf->data, sf->file_size);
 #endif
+        } else {
+            vox_mem_free(sf->data);
+        }
     }
-    free(sf->path);
-    free(sf->header_json);
-    free(sf);
+    vox_mem_free(sf->path);
+    vox_mem_free(sf->header_json);
+    vox_mem_free(sf);
 }
 
 const safetensor_t *safetensors_find(const safetensors_file_t *sf, const char *name) {
@@ -408,7 +505,7 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     size_t elem_size = (t->dtype == DTYPE_F32) ? 4 : 2;
     if ((size_t)n * elem_size > t->data_size) return NULL;
 
-    float *out = malloc(n * sizeof(float));
+    float *out = vox_mem_malloc(n * sizeof(float));
     if (!out) return NULL;
 
     const void *data = safetensors_data(sf, t);
@@ -436,7 +533,7 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
 
         default:
             fprintf(stderr, "safetensors_get_f32: unsupported dtype\n");
-            free(out);
+            vox_mem_free(out);
             return NULL;
     }
 
@@ -461,7 +558,7 @@ uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t 
     const void *data = safetensors_data(sf, t);
     if (!data) return NULL;
 
-    uint16_t *out = (uint16_t *)malloc(n * sizeof(uint16_t));
+    uint16_t *out = (uint16_t *)vox_mem_malloc(n * sizeof(uint16_t));
     if (!out) return NULL;
 
     memcpy(out, data, n * sizeof(uint16_t));
@@ -497,3 +594,4 @@ void safetensors_print_all(const safetensors_file_t *sf) {
         safetensor_print(&sf->tensors[i]);
     }
 }
+

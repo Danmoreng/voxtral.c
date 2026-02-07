@@ -7,6 +7,8 @@
 
 static int g_cuda_initialized = 0;
 static cublasHandle_t g_cublas_handle = NULL;
+static float *g_scratch_f32 = NULL;
+static size_t g_scratch_size = 0;
 
 #define CUDA_CHECK(call) \
     do { \
@@ -41,17 +43,32 @@ void vox_cuda_init(void) {
     /* Set math mode to allow Tensor Cores (TF32) on Ampere+ */
     cublasSetMathMode(g_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
+    /* Pre-allocate a reasonable scratch buffer for BF16 dequant (e.g. 64MB) */
+    g_scratch_size = 64 * 1024 * 1024;
+    CUDA_CHECK(cudaMalloc(&g_scratch_f32, g_scratch_size));
+
     g_cuda_initialized = 1;
     fprintf(stderr, "[CUDA] Initialized (Device 0)\n");
 }
 
 void vox_cuda_shutdown(void) {
     if (!g_cuda_initialized) return;
+    if (g_scratch_f32) {
+        cudaFree(g_scratch_f32);
+        g_scratch_f32 = NULL;
+        g_scratch_size = 0;
+    }
     if (g_cublas_handle) {
         cublasDestroy(g_cublas_handle);
         g_cublas_handle = NULL;
     }
     g_cuda_initialized = 0;
+}
+
+void *vox_cuda_malloc_managed(size_t size) {
+    void *ptr = NULL;
+    CUDA_CHECK(cudaMallocManaged(&ptr, size, cudaMemAttachGlobal));
+    return ptr;
 }
 
 void *vox_cuda_malloc(size_t size) {
@@ -80,7 +97,6 @@ __global__ void k_rms_norm(float *out, const float *x, const float *weight, int 
     int row = blockIdx.x;
     int tid = threadIdx.x;
     
-    /* Simple block reduction for RMS */
     extern __shared__ float sdata[];
     
     float sum_sq = 0.0f;
@@ -91,7 +107,6 @@ __global__ void k_rms_norm(float *out, const float *x, const float *weight, int 
     sdata[tid] = sum_sq;
     __syncthreads();
 
-    /* Reduction in shared memory */
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             sdata[tid] += sdata[tid + s];
@@ -118,6 +133,7 @@ void vox_cuda_rms_norm(float *out, const float *x, const float *weight, int n, i
     size_t shared_mem = threads * sizeof(float);
     k_rms_norm<<<n, threads, shared_mem>>>(out, x, weight, hidden, eps);
     CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
 }
 
 __global__ void k_silu(float *x, int n) {
@@ -164,6 +180,7 @@ void vox_cuda_add_inplace(float *a, const float *b, int n) {
     int blocks = (n + threads - 1) / threads;
     k_add_inplace<<<blocks, threads>>>(a, b, n);
     CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
 }
 
 __global__ void k_mul_inplace(float *a, const float *b, int n) {
@@ -178,45 +195,101 @@ void vox_cuda_mul_inplace(float *a, const float *b, int n) {
     int blocks = (n + threads - 1) / threads;
     k_mul_inplace<<<blocks, threads>>>(a, b, n);
     CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
 }
 
-/* C[m,n] = A[m,k] * B[k,n] */
-/* Note: cuBLAS is column-major by default.
-   To compute C (row-major) = A (row-major) * B (row-major):
-   We want C^T = B^T * A^T.
-   cuBLAS sees A as k*m (col-major) and B as n*k (col-major).
-   So we compute C^T = B * A using cublasSgemm.
-   
-   cublasSgemm(handle, OP_N, OP_N, n, m, k, alpha, B, n, A, k, beta, C, n)
-*/
 void vox_cuda_sgemm(int m, int n, int k, const float *a, const float *b, float *c) {
     float alpha = 1.0f;
     float beta = 0.0f;
     
-    /* A[m][k] row-major -> viewed as A^T[k][m] col-major
-       B[k][n] row-major -> viewed as B^T[n][k] col-major
-       C[m][n] row-major -> viewed as C^T[n][m] col-major
-       
-       We want C = A * B.
-       In column-major land: C^T = B^T * A^T.
-       
-       So we effectively pass:
-       LDA = k (leading dimension of A^T is k)
-       LDB = n (leading dimension of B^T is n)
-       LDC = n (leading dimension of C^T is n)
+    /* C = A * B -> C^T = B^T * A^T
+       A, B, C are standard FP32 pointers (Managed)
     */
     
     cublasStatus_t status = cublasSgemm(g_cublas_handle,
                                         CUBLAS_OP_N, CUBLAS_OP_N,
                                         n, m, k,
                                         &alpha,
-                                        b, n,  /* B^T is n x k, leading dim n */
-                                        a, k,  /* A^T is k x m, leading dim k */
+                                        b, n,
+                                        a, k,
                                         &beta,
-                                        c, n); /* C^T is n x m, leading dim n */
+                                        c, n);
                                         
     if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cublasSgemm failed\n");
+        fprintf(stderr, "cublasSgemm failed: status=%d\n", status);
         exit(1);
     }
+    cudaDeviceSynchronize();
 }
+
+void vox_cuda_sgemm_t(int m, int n, int k, const float *a, const float *b, float *c) {
+    /* C = A * B^T -> C^T = (A * B^T)^T = B * A^T
+       A (MxK), B (NxK) [transposed logic], C (MxN)
+    */
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    
+    cublasStatus_t status = cublasSgemm(g_cublas_handle,
+                                        CUBLAS_OP_T, CUBLAS_OP_N,
+                                        n, m, k,
+                                        &alpha,
+                                        b, k,
+                                        a, k,
+                                        &beta,
+                                        c, n);
+                                        
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cublasSgemm (T) failed: status=%d\n", status);
+        exit(1);
+    }
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_bf16_to_f32_conv(float *out, const unsigned short *in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned short val = in[i];
+        unsigned int res = (unsigned int)val << 16;
+        out[i] = *(float*)&res;
+    }
+}
+
+void vox_cuda_matmul_t_bf16(int m, int n, int k, const float *a, const unsigned short *b_bf16, float *c) {
+    /* Fallback implementation: Dequantize to temporary FP32 buffer on GPU, then SGEMM.
+       Uses a persistent scratch buffer to avoid cudaMalloc overhead.
+    */
+    size_t required = (size_t)n * k * sizeof(float);
+    if (required > g_scratch_size) {
+        if (g_scratch_f32) cudaFree(g_scratch_f32);
+        g_scratch_size = required * 2; /* Grow with buffer room */
+        CUDA_CHECK(cudaMalloc(&g_scratch_f32, g_scratch_size));
+    }
+    
+    float *d_b_f32 = g_scratch_f32;
+    
+    /* Dequantize on GPU */
+    int total_elems = n * k;
+    int threads = 256;
+    int blocks = (total_elems + threads - 1) / threads;
+    k_bf16_to_f32_conv<<<blocks, threads>>>(d_b_f32, b_bf16, total_elems);
+    
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    
+    cublasStatus_t status = cublasSgemm(g_cublas_handle,
+                                        CUBLAS_OP_T, CUBLAS_OP_N,
+                                        n, m, k,
+                                        &alpha,
+                                        d_b_f32, k,
+                                        a, k,
+                                        &beta,
+                                        c, n);
+                                        
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cublasSgemm (BF16 fallback) failed: status=%d\n", status);
+        exit(1);
+    }
+    /* Sync before returning to Host so following CPU logic sees results */
+    cudaDeviceSynchronize();
+}
+

@@ -146,7 +146,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
     /* ---- Conv stem ---- */
     /* mel: [mel_frames, 128] -> transpose to [128, mel_frames] for conv1d */
-    float *conv_in = (float *)malloc(VOX_MEL_BINS * mel_frames * sizeof(float));
+    float *conv_in = (float *)vox_mem_malloc(VOX_MEL_BINS * mel_frames * sizeof(float));
     for (int f = 0; f < mel_frames; f++) {
         for (int m = 0; m < VOX_MEL_BINS; m++) {
             conv_in[m * mel_frames + f] = mel[f * VOX_MEL_BINS + m];
@@ -155,49 +155,49 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
     /* Conv0: [128, mel_frames] -> [1280, mel_frames] (stride=1, causal) */
     int conv0_out_len = causal_conv1d_out_len(mel_frames, 3, 1);
-    float *conv0_out = (float *)malloc(dim * conv0_out_len * sizeof(float));
+    float *conv0_out = (float *)vox_mem_malloc(dim * conv0_out_len * sizeof(float));
     vox_causal_conv1d(conv0_out, conv_in, enc->conv0_weight, enc->conv0_bias,
                       VOX_MEL_BINS, dim, mel_frames, 3, 1);
     gelu_inplace(conv0_out, dim * conv0_out_len);
-    free(conv_in);
+    vox_mem_free(conv_in);
 
     /* Conv1: [1280, mel_frames] -> [1280, ceil(mel_frames/2)] (stride=2, causal) */
     int conv1_out_len = causal_conv1d_out_len(conv0_out_len, 3, 2);
-    float *conv1_out = (float *)malloc(dim * conv1_out_len * sizeof(float));
+    float *conv1_out = (float *)vox_mem_malloc(dim * conv1_out_len * sizeof(float));
     vox_causal_conv1d(conv1_out, conv0_out, enc->conv1_weight, enc->conv1_bias,
                       dim, dim, conv0_out_len, 3, 2);
     gelu_inplace(conv1_out, dim * conv1_out_len);
-    free(conv0_out);
+    vox_mem_free(conv0_out);
 
     int seq_len = conv1_out_len;
 
     /* Transpose: [1280, seq_len] -> [seq_len, 1280] */
-    float *x = (float *)malloc(seq_len * dim * sizeof(float));
+    float *x = (float *)vox_mem_malloc(seq_len * dim * sizeof(float));
     for (int s = 0; s < seq_len; s++) {
         for (int d = 0; d < dim; d++) {
             x[s * dim + d] = conv1_out[d * seq_len + s];
         }
     }
-    free(conv1_out);
+    vox_mem_free(conv1_out);
 
     if (vox_verbose >= 2)
         fprintf(stderr, "  Conv stem: %d frames -> %d\n", mel_frames, seq_len);
 
     /* ---- Transformer layers ---- */
-    float *x_norm = (float *)malloc(seq_len * dim * sizeof(float));
-    float *q = (float *)malloc(seq_len * qkv_dim * sizeof(float));
-    float *k = (float *)malloc(seq_len * qkv_dim * sizeof(float));
-    float *v = (float *)malloc(seq_len * qkv_dim * sizeof(float));
-    float *attn_out = (float *)malloc(seq_len * qkv_dim * sizeof(float));
-    float *proj_out = (float *)malloc(seq_len * dim * sizeof(float));
-    float *gate = (float *)malloc(seq_len * hidden * sizeof(float));
-    float *up = (float *)malloc(seq_len * hidden * sizeof(float));
-    float *ffn_out = (float *)malloc(seq_len * dim * sizeof(float));
+    float *x_norm = (float *)vox_mem_malloc(seq_len * dim * sizeof(float));
+    float *q = (float *)vox_mem_malloc(seq_len * qkv_dim * sizeof(float));
+    float *k = (float *)vox_mem_malloc(seq_len * qkv_dim * sizeof(float));
+    float *v = (float *)vox_mem_malloc(seq_len * qkv_dim * sizeof(float));
+    float *attn_out = (float *)vox_mem_malloc(seq_len * qkv_dim * sizeof(float));
+    float *proj_out = (float *)vox_mem_malloc(seq_len * dim * sizeof(float));
+    float *gate = (float *)vox_mem_malloc(seq_len * hidden * sizeof(float));
+    float *up = (float *)vox_mem_malloc(seq_len * hidden * sizeof(float));
+    float *ffn_out = (float *)vox_mem_malloc(seq_len * dim * sizeof(float));
 
     /* RoPE frequencies */
-    int *positions = (int *)malloc(seq_len * sizeof(int));
+    int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
     for (int i = 0; i < seq_len; i++) positions[i] = i;
-    float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
+    float *rope_freqs = (float *)vox_mem_malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
     vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
@@ -299,10 +299,10 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     vox_rms_norm(x, x, enc->norm, seq_len, dim, VOX_ENC_NORM_EPS);
 
     /* Clean up working buffers */
-    free(x_norm); free(q); free(k); free(v);
-    free(attn_out); free(proj_out);
-    free(gate); free(up); free(ffn_out);
-    free(positions); free(rope_freqs);
+    vox_mem_free(x_norm); vox_mem_free(q); vox_mem_free(k); vox_mem_free(v);
+    vox_mem_free(attn_out); vox_mem_free(proj_out);
+    vox_mem_free(gate); vox_mem_free(up); vox_mem_free(ffn_out);
+    vox_mem_free(positions); vox_mem_free(rope_freqs);
 
     *out_seq_len = seq_len;
     return x;
@@ -335,8 +335,8 @@ int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos) {
     } else
 #endif
     {
-        ctx->enc_kv_cache_k = (float *)calloc(1, total);
-        ctx->enc_kv_cache_v = (float *)calloc(1, total);
+        ctx->enc_kv_cache_k = (float *)vox_mem_calloc(1, total);
+        ctx->enc_kv_cache_v = (float *)vox_mem_calloc(1, total);
     }
 
     if (!ctx->enc_kv_cache_k || !ctx->enc_kv_cache_v) return -1;
@@ -360,9 +360,9 @@ static int enc_kv_cache_grow(vox_ctx_t *ctx, int required) {
     size_t new_stride = (size_t)new_max * ENC_KV_DIM;
     size_t total = (size_t)VOX_ENC_LAYERS * new_stride * sizeof(float);
 
-    float *new_k = (float *)calloc(1, total);
-    float *new_v = (float *)calloc(1, total);
-    if (!new_k || !new_v) { free(new_k); free(new_v); return -1; }
+    float *new_k = (float *)vox_mem_calloc(1, total);
+    float *new_v = (float *)vox_mem_calloc(1, total);
+    if (!new_k || !new_v) { vox_mem_free(new_k); vox_mem_free(new_v); return -1; }
 
     /* Copy existing data */
     if (ctx->enc_kv_cache_len > 0 && ctx->enc_kv_cache_k) {
@@ -374,8 +374,8 @@ static int enc_kv_cache_grow(vox_ctx_t *ctx, int required) {
         }
     }
 
-    free(ctx->enc_kv_cache_k);
-    free(ctx->enc_kv_cache_v);
+    vox_mem_free(ctx->enc_kv_cache_k);
+    vox_mem_free(ctx->enc_kv_cache_v);
     ctx->enc_kv_cache_k = new_k;
     ctx->enc_kv_cache_v = new_v;
     ctx->enc_kv_cache_max = new_max;
@@ -403,17 +403,16 @@ static void enc_kv_cache_compact(vox_ctx_t *ctx) {
 }
 
 static int enc_realloc_float(float **ptr, size_t elems) {
-    float *tmp = (float *)realloc(*ptr, elems * sizeof(float));
-    if (!tmp) return -1;
-    *ptr = tmp;
-    return 0;
+    /* Scratch buffers don't need to preserve content, so free+malloc is safe and supports Managed Memory */
+    if (*ptr) vox_mem_free(*ptr);
+    *ptr = (float *)vox_mem_malloc(elems * sizeof(float));
+    return (*ptr == NULL) ? -1 : 0;
 }
 
 static int enc_realloc_int(int **ptr, size_t elems) {
-    int *tmp = (int *)realloc(*ptr, elems * sizeof(int));
-    if (!tmp) return -1;
-    *ptr = tmp;
-    return 0;
+    if (*ptr) vox_mem_free(*ptr);
+    *ptr = (int *)vox_mem_malloc(elems * sizeof(int));
+    return (*ptr == NULL) ? -1 : 0;
 }
 
 /* Grow persistent incremental-encoder scratch buffers for new_len positions. */
@@ -475,12 +474,12 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                 new_len, cache_len, ctx->enc_kv_pos_offset);
 
     /* Output/working state for new positions */
-    float *x = (float *)malloc((size_t)new_len * dim * sizeof(float));
+    float *x = (float *)vox_mem_malloc((size_t)new_len * dim * sizeof(float));
     if (!x) { *out_len = 0; return NULL; }
     memcpy(x, x_new, (size_t)new_len * dim * sizeof(float));
 
     if (enc_inc_ensure_buffers(ctx, new_len) != 0) {
-        free(x);
+        vox_mem_free(x);
         *out_len = 0;
         return NULL;
     }
@@ -639,7 +638,7 @@ float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,
     int ds_len = enc_seq_len / VOX_DOWNSAMPLE;
     int ds_dim = VOX_ENC_DIM * VOX_DOWNSAMPLE; /* 5120 */
 
-    float *ds = (float *)malloc(ds_len * ds_dim * sizeof(float));
+    float *ds = (float *)vox_mem_malloc(ds_len * ds_dim * sizeof(float));
     for (int i = 0; i < ds_len; i++) {
         for (int j = 0; j < VOX_DOWNSAMPLE; j++) {
             memcpy(ds + i * ds_dim + j * VOX_ENC_DIM,
@@ -653,16 +652,17 @@ float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,
                 enc_seq_len, ds_len, VOX_DOWNSAMPLE);
 
     /* Linear(5120 -> 3072) -> GELU -> Linear(3072 -> 3072) */
-    float *mid = (float *)malloc(ds_len * VOX_DEC_DIM * sizeof(float));
+    float *mid = (float *)vox_mem_malloc(ds_len * VOX_DEC_DIM * sizeof(float));
     vox_linear_nobias_bf16(mid, ds, ctx->adapter.linear0_weight_bf16, ds_len, ds_dim, VOX_DEC_DIM);
     vox_gelu(mid, ds_len * VOX_DEC_DIM);
 
-    float *out = (float *)malloc(ds_len * VOX_DEC_DIM * sizeof(float));
+    float *out = (float *)vox_mem_malloc(ds_len * VOX_DEC_DIM * sizeof(float));
     vox_linear_nobias_bf16(out, mid, ctx->adapter.linear1_weight_bf16, ds_len, VOX_DEC_DIM, VOX_DEC_DIM);
 
-    free(ds);
-    free(mid);
+    vox_mem_free(ds);
+    vox_mem_free(mid);
 
     *out_seq_len = ds_len;
     return out;
 }
+

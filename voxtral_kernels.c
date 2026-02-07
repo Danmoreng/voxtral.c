@@ -4,6 +4,7 @@
  */
 
 #include "voxtral_kernels.h"
+#include "voxtral.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -230,6 +231,12 @@ void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 }
 
 void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_sgemm_t(M, N, K, A, B, C);
+        return;
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
@@ -319,8 +326,8 @@ static size_t bf16_scratch_cap = 0;
 
 static float *bf16_get_scratch(size_t n) {
     if (n > bf16_scratch_cap) {
-        free(bf16_scratch);
-        bf16_scratch = (float *)malloc(n * sizeof(float));
+        vox_mem_free(bf16_scratch);
+        bf16_scratch = (float *)vox_mem_malloc(n * sizeof(float));
         bf16_scratch_cap = bf16_scratch ? n : 0;
     }
     return bf16_scratch;
@@ -406,6 +413,12 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
 
 void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUDA
+    if (vox_cuda_available() && seq_len > 1) {
+        vox_cuda_matmul_t_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
+        return;
+    }
+#endif
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
@@ -436,6 +449,19 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
 
 void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                      const float *b, int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUDA
+    if (vox_cuda_available() && seq_len > 1) {
+        vox_cuda_matmul_t_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
@@ -483,6 +509,12 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 
 void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_matmul_t_bf16(M, N, K, A, B_bf16, C);
+        return;
+    }
+#endif
     /*
      * C[M,N] = A[M,K] @ B[N,K]^T
      * For M=1: use fused BF16 matvec (no intermediate buffer needed).
@@ -558,7 +590,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
 
     /* Build im2col matrix: [K, out_length] row-major.
      * im2col[ic*kernel_size + k, ol] = in[ic, ol*stride - left_pad + k] (0 if OOB) */
-    float *im2col = (float *)calloc((size_t)K * out_length, sizeof(float));
+    float *im2col = (float *)vox_mem_calloc((size_t)K * out_length, sizeof(float));
     for (int ol = 0; ol < out_length; ol++) {
         for (int ic = 0; ic < channels_in; ic++) {
             for (int k = 0; k < kernel_size; k++) {
@@ -584,7 +616,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
     /* Use vox_matmul (which handles AVX2/AVX512/OpenMP) instead of raw loop */
     vox_matmul(out, weight, im2col, channels_out, K, out_length);
 #endif
-    free(im2col);
+    vox_mem_free(im2col);
 
     /* Add bias */
     if (bias) {
