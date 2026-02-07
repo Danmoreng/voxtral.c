@@ -32,19 +32,45 @@
  * ======================================================================== */
 
 void vox_add_inplace(float *a, const float *b, int n) {
-    for (int i = 0; i < n; i++) a[i] += b[i];
+    int i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    for (; i <= n - 8; i += 8) {
+        _mm256_storeu_ps(a + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    }
+#endif
+    for (; i < n; i++) a[i] += b[i];
 }
 
 void vox_mul_inplace(float *a, const float *b, int n) {
-    for (int i = 0; i < n; i++) a[i] *= b[i];
+    int i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    for (; i <= n - 8; i += 8) {
+        _mm256_storeu_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    }
+#endif
+    for (; i < n; i++) a[i] *= b[i];
 }
 
 void vox_axpy(float *a, float scale, const float *b, int n) {
-    for (int i = 0; i < n; i++) a[i] += scale * b[i];
+    int i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    __m256 s = _mm256_set1_ps(scale);
+    for (; i <= n - 8; i += 8) {
+        _mm256_storeu_ps(a + i, _mm256_fmadd_ps(s, _mm256_loadu_ps(b + i), _mm256_loadu_ps(a + i)));
+    }
+#endif
+    for (; i < n; i++) a[i] += scale * b[i];
 }
 
 void vox_scale(float *x, float s, int n) {
-    for (int i = 0; i < n; i++) x[i] *= s;
+    int i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    __m256 s_vec = _mm256_set1_ps(s);
+    for (; i <= n - 8; i += 8) {
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), s_vec));
+    }
+#endif
+    for (; i < n; i++) x[i] *= s;
 }
 
 void vox_copy(float *dst, const float *src, int n) {
@@ -399,13 +425,35 @@ void vox_rms_norm(float *out, const float *x, const float *weight,
         float *out_row = out + s * hidden;
 
         float sum_sq = 0.0f;
-        for (int i = 0; i < hidden; i++) {
+        int i = 0;
+
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+        __m256 v_sum_sq = _mm256_setzero_ps();
+        for (; i <= hidden - 8; i += 8) {
+            __m256 v_x = _mm256_loadu_ps(x_row + i);
+            v_sum_sq = _mm256_fmadd_ps(v_x, v_x, v_sum_sq);
+        }
+        float temp[8];
+        _mm256_storeu_ps(temp, v_sum_sq);
+        for (int j = 0; j < 8; j++) sum_sq += temp[j];
+#endif
+        for (; i < hidden; i++) {
             sum_sq += x_row[i] * x_row[i];
         }
+
         float rms = sqrtf(sum_sq / hidden + eps);
         float rms_inv = 1.0f / rms;
 
-        for (int i = 0; i < hidden; i++) {
+        i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+        __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
+        for (; i <= hidden - 8; i += 8) {
+            __m256 v_x = _mm256_loadu_ps(x_row + i);
+            __m256 v_w = _mm256_loadu_ps(weight + i);
+            _mm256_storeu_ps(out_row + i, _mm256_mul_ps(_mm256_mul_ps(v_x, v_rms_inv), v_w));
+        }
+#endif
+        for (; i < hidden; i++) {
             out_row[i] = x_row[i] * rms_inv * weight[i];
         }
     }
@@ -415,17 +463,83 @@ void vox_rms_norm(float *out, const float *x, const float *weight,
  * Activation Functions
  * ======================================================================== */
 
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+/* Fast vectorized exp approximation for SiLU/GELU */
+static inline __m256 exp256_ps(__m256 x) {
+    /* exp(x) = 2^(x * log2(e)) */
+    static const __m256 log2e = {1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
+                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f};
+    static const __m256 c1 = {0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f};
+    static const __m256 c2 = {-2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f};
+    static const __m256 p0 = {1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f};
+    static const __m256 p1 = {1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f};
+    static const __m256 p2 = {8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f};
+    static const __m256 p3 = {4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f};
+    static const __m256 p4 = {1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f};
+    static const __m256 p5 = {5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f};
+
+    __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT |_MM_FROUND_NO_EXC);
+    __m256 t = _mm256_fnmadd_ps(fx, c1, x);
+    t = _mm256_fnmadd_ps(fx, c2, t);
+    __m256 z = _mm256_mul_ps(t, t);
+    __m256 y = _mm256_fmadd_ps(p0, t, p1);
+    y = _mm256_fmadd_ps(y, t, p2);
+    y = _mm256_fmadd_ps(y, t, p3);
+    y = _mm256_fmadd_ps(y, t, p4);
+    y = _mm256_fmadd_ps(y, t, p5);
+    y = _mm256_add_ps(_mm256_fmadd_ps(y, z, t), _mm256_set1_ps(1.0f));
+
+    /* Build 2^n */
+    __m256i imm0 = _mm256_cvtps_epi32(fx);
+    imm0 = _mm256_add_epi32(imm0, _mm256_set1_epi32(127));
+    imm0 = _mm256_slli_epi32(imm0, 23);
+    __m256 pow2n = _mm256_castsi256_ps(imm0);
+
+    return _mm256_mul_ps(y, pow2n);
+}
+#endif
+
 void vox_silu(float *x, int n) {
-    for (int i = 0; i < n; i++) {
+    int i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    __m256 one = _mm256_set1_ps(1.0f);
+    for (; i <= n - 8; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vexp = exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), vx));
+        __m256 res = _mm256_div_ps(vx, _mm256_add_ps(one, vexp));
+        _mm256_storeu_ps(x + i, res);
+    }
+#endif
+    for (; i < n; i++) {
         float val = x[i];
         x[i] = val / (1.0f + expf(-val));
     }
 }
 
 void vox_gelu(float *x, int n) {
-    for (int i = 0; i < n; i++) {
+    int i = 0;
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    /* GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
+    __m256 half = _mm256_set1_ps(0.5f);
+    __m256 one = _mm256_set1_ps(1.0f);
+    __m256 k0 = _mm256_set1_ps(0.7978845608f); /* sqrt(2/pi) */
+    __m256 k1 = _mm256_set1_ps(0.044715f);
+
+    for (; i <= n - 8; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 x3 = _mm256_mul_ps(_mm256_mul_ps(vx, vx), vx);
+        __m256 inner = _mm256_mul_ps(k0, _mm256_fmadd_ps(k1, x3, vx));
+        
+        /* tanh(x) approx using exp: (exp(2x) - 1) / (exp(2x) + 1) */
+        __m256 e2x = exp256_ps(_mm256_mul_ps(_mm256_set1_ps(2.0f), inner));
+        __m256 vtanh = _mm256_div_ps(_mm256_sub_ps(e2x, one), _mm256_add_ps(e2x, one));
+        
+        __m256 res = _mm256_mul_ps(half, _mm256_mul_ps(vx, _mm256_add_ps(one, vtanh)));
+        _mm256_storeu_ps(x + i, res);
+    }
+#endif
+    for (; i < n; i++) {
         float val = x[i];
-        /* GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
         float x3 = val * val * val;
         float inner = 0.7978845608028654f * (val + 0.044715f * x3);
         x[i] = 0.5f * val * (1.0f + tanhf(inner));
