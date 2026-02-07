@@ -1,6 +1,9 @@
 voxtral_shaders_source.h
 voxtral
+voxtral.exe
 voxtral-model/
 pyenv*/
 misc/
 *.o
+*.obj
+*.wav
