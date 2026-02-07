@@ -233,14 +233,22 @@ Choose a backend when building:
 make            # Show available backends
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+<<<<<<< HEAD
 make cpu        # Pure C, no dependencies (slower)
+=======
+make avx512     # AVX-512 BF16 direct (Linux, no OpenBLAS needed)
+>>>>>>> avx512-integration
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
 - Linux with OpenBLAS: `make blas`
+<<<<<<< HEAD
 - Windows: `.\build.ps1`
+=======
+- Linux with AVX-512 BF16: `make avx512` (For AMD Zen 4+ and Intel Sapphire Rapids+ CPUs. A runtime check will print an error if the CPU lacks support.)
+>>>>>>> avx512-integration
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
