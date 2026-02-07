@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <signal.h>
+#include <unistd.h>
 #include <math.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
@@ -33,7 +35,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -d <dir>      Model directory (with consolidated.safetensors, tekken.json)\n");
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
-    fprintf(stderr, "  --from-mic    Capture from default microphone (macOS/Windows only, Ctrl+C to stop)\n");
+    fprintf(stderr, "  --from-mic    Capture from default microphone (macOS only, Ctrl+C to stop)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
@@ -181,14 +183,17 @@ int main(int argc, char **argv) {
     int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
 
     /* Load model */
-    double t0_load = vox_get_time_ms();
+    struct timeval t0_load, t1_load;
+    gettimeofday(&t0_load, NULL);
     vox_ctx_t *ctx = vox_load(model_dir);
-    double load_ms = vox_get_time_ms() - t0_load;
+    gettimeofday(&t1_load, NULL);
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);
         return 1;
     }
     if (force_timing) {
+        double load_ms = (t1_load.tv_sec - t0_load.tv_sec) * 1000.0 +
+                         (t1_load.tv_usec - t0_load.tv_usec) / 1000.0;
         fprintf(stderr, "Model load: %.0f ms\n", load_ms);
     }
 
@@ -207,8 +212,8 @@ int main(int argc, char **argv) {
         if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
     }
 
-    double t0_run_ms = 0;
-    if (!use_mic) t0_run_ms = vox_get_time_ms();
+    struct timeval t0_run, t1_run;
+    if (!use_mic) gettimeofday(&t0_run, NULL);
 
     if (use_mic) {
         /* Microphone capture with silence cancellation */
@@ -219,15 +224,11 @@ int main(int argc, char **argv) {
         }
 
         /* Install SIGINT handler for clean Ctrl+C exit */
-#ifdef _WIN32
-        signal(SIGINT, sigint_handler);
-#else
         struct sigaction sa;
         sa.sa_handler = sigint_handler;
         sa.sa_flags = 0;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, NULL);
-#endif
 
         if (vox_verbose >= 1)
             fprintf(stderr, "Listening (Ctrl+C to stop)...\n");
@@ -261,11 +262,7 @@ int main(int argc, char **argv) {
 
             int n = vox_mic_read(mic_buf, 4800);
             if (n == 0) {
-#ifdef _WIN32
-                Sleep(10);
-#else
                 usleep(10000); /* 10ms idle sleep */
-#endif
                 continue;
             }
 
@@ -415,8 +412,10 @@ int main(int argc, char **argv) {
     }
 
     if (!use_mic) {
-        double run_ms = vox_get_time_ms() - t0_run_ms;
+        gettimeofday(&t1_run, NULL);
         if (force_timing) {
+            double run_ms = (t1_run.tv_sec - t0_run.tv_sec) * 1000.0 +
+                            (t1_run.tv_usec - t0_run.tv_usec) / 1000.0;
             fprintf(stderr, "Wall transcribe: %.0f ms\n", run_ms);
         }
     }

@@ -21,24 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
-
-double vox_get_time_ms(void) {
-#ifdef _WIN32
-    static LARGE_INTEGER frequency;
-    static int started = 0;
-    if (!started) {
-        QueryPerformanceFrequency(&frequency);
-        started = 1;
-    }
-    LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)frequency.QuadPart;
-#else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
-#endif
-}
+#include <sys/time.h>
 
 /* Global verbose flag */
 int vox_verbose = 0;
@@ -261,19 +244,6 @@ vox_ctx_t *vox_load(const char *model_dir) {
     }
 #endif
 
-#ifdef USE_CUDA
-    /* Optional: prefetch CUDA weight caches at load time to avoid paying for
-     * weight uploads in the first transcription call. */
-    if (vox_cuda_available()) {
-        const char *env = getenv("VOX_CUDA_PREFETCH");
-        if (env && env[0] && env[0] != '0') {
-            if (vox_verbose >= 2)
-                fprintf(stderr, "Pre-warming CUDA weight cache...\n");
-            (void)vox_cuda_prefetch_weights(ctx);
-        }
-    }
-#endif
-
     if (vox_verbose >= 1)
         fprintf(stderr, "Model loaded.\n");
     return ctx;
@@ -285,10 +255,6 @@ vox_ctx_t *vox_load(const char *model_dir) {
 
 void vox_free(vox_ctx_t *ctx) {
     if (!ctx) return;
-
-#ifdef USE_CUDA
-    vox_cuda_ctx_free(ctx);
-#endif
 
     /* Free f32 weights that were converted/copied from safetensors. */
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
@@ -459,9 +425,8 @@ struct vox_stream {
 
     /* Adapter output buffer (growing) */
     float *adapter_buf;
-    int total_adapter;      /* total logical tokens produced */
+    int total_adapter;
     int adapter_cap;
-    int adapter_pos_offset; /* logical offset from compactions */
 
     /* Decoder state */
     int decoder_started;
@@ -469,9 +434,6 @@ struct vox_stream {
     int prev_token;
     int eos_seen;
     int finished;       /* vox_stream_finish() called */
-
-    /* Stream lifecycle flags */
-    int init_ok;        /* used to suppress stats printing for failed init */
 
     /* Pending token queue (circular buffer, VOX_MAX_ALT strings per position) */
     const char **token_queue;   /* [queue_cap * VOX_MAX_ALT] */
@@ -738,76 +700,6 @@ static int stream_use_cuda_encoder_full(void) {
 #endif
 }
 
-static int stream_use_cuda_pipeline_full(void);
-
-/* Compact adapter buffer: discard tokens the decoder has already consumed */
-static void stream_adapter_compact(vox_stream_t *s) {
-    int consumed = s->gen_pos - s->adapter_pos_offset;
-    if (consumed <= 0) return;
-
-#ifdef USE_CUDA
-	    if (!s->adapter_buf) {
-	        /* VOX_CUDA_PIPELINE_FULL keeps the adapter on-device. */
-	        if (stream_use_cuda_pipeline_full()) {
-	            vox_cuda_stream_adapter_compact(s->ctx, consumed);
-	            s->adapter_pos_offset += consumed;
-	        }
-	        return;
-	    }
-#else
-    if (!s->adapter_buf) return;
-#endif
-
-    int dim = VOX_DEC_DIM;
-    int remaining = (s->total_adapter - s->adapter_pos_offset) - consumed;
-
-    if (remaining > 0)
-        memmove(s->adapter_buf,
-                s->adapter_buf + (size_t)consumed * dim,
-                (size_t)remaining * dim * sizeof(float));
-
-    s->adapter_pos_offset += consumed;
-}
-
-/* Optional: keep adapter embeddings on device and let CUDA build the decoder step
- * embeddings directly from the adapter buffer (opt-in via VOX_CUDA_PIPELINE_FULL=1). */
-static int stream_use_cuda_pipeline_full(void) {
-#ifdef USE_CUDA
-    static int cached = -1;
-    if (cached != -1) return cached;
-
-    const char *disable = getenv("VOX_DISABLE_CUDA_PIPELINE_FULL");
-    if (disable && disable[0] && disable[0] != '0') {
-        cached = 0;
-        return cached;
-    }
-
-    const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
-    if (!env || !env[0] || env[0] == '0') {
-        cached = 0;
-        return cached;
-    }
-
-    /* Requires the full CUDA encoder path since we rely on device-side adapter output. */
-    cached = stream_use_cuda_encoder_full();
-    return cached;
-#else
-    return 0;
-#endif
-}
-
-/* Streaming EOS handling:
- * - Default behavior is to treat EOS as provisional until finish() is called,
- *   so long-running streams (e.g. microphone) don't get stuck after a flush.
- * - Set VOX_STREAM_STRICT_EOS=1 to stop decoding as soon as EOS is produced. */
-static int stream_strict_eos(void) {
-    static int cached = -1;
-    if (cached != -1) return cached;
-    const char *env = getenv("VOX_STREAM_STRICT_EOS");
-    cached = (env && env[0] && env[0] != '0');
-    return cached;
-}
-
 /* Run encoder on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
@@ -830,12 +722,6 @@ static void stream_run_encoder(vox_stream_t *s) {
                 slice_start = 0;
                 actual_overlap_mel = 0;
                 s->total_adapter = 0;
-                s->adapter_pos_offset = 0;
-#ifdef USE_CUDA
-                if (stream_use_cuda_pipeline_full()) {
-                    vox_cuda_stream_adapter_reset(s->ctx);
-                }
-#endif
             } else {
                 actual_overlap_mel = s->mel_cursor - slice_start;
             }
@@ -848,26 +734,19 @@ static void stream_run_encoder(vox_stream_t *s) {
             int slice_len = slice_end - slice_start;
             if (slice_len <= 0) break;
 
-            double t0 = vox_get_time_ms();
+            struct timeval t0, t1;
+            gettimeofday(&t0, NULL);
 
             float *adapter_chunk = NULL;
             int chunk_tokens = 0;
 
             int used_cuda = 0;
 #ifdef USE_CUDA
-            if (stream_use_cuda_pipeline_full()) {
-                used_cuda = vox_cuda_encode_adapter_stream_append(&chunk_tokens,
-                                                                  s->ctx,
-                                                                  mel_data + (size_t)slice_start * VOX_MEL_BINS,
-                                                                  slice_len,
-                                                                  actual_overlap_mel);
-            } else {
-                used_cuda = vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
-                                                    s->ctx,
-                                                    mel_data + (size_t)slice_start * VOX_MEL_BINS,
-                                                    slice_len,
-                                                    actual_overlap_mel);
-            }
+            used_cuda = vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
+                                                s->ctx,
+                                                mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                                                slice_len,
+                                                actual_overlap_mel);
 #endif
 
             if (!used_cuda) {
@@ -894,27 +773,23 @@ static void stream_run_encoder(vox_stream_t *s) {
                 if (new_enc_len > 0 && !adapter_chunk) break;
             }
 
-            s->encoder_ms += vox_get_time_ms() - t0;
+            gettimeofday(&t1, NULL);
+            s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (t1.tv_usec - t0.tv_usec) / 1000.0;
 
-            if (chunk_tokens > 0) {
-                if (stream_use_cuda_pipeline_full() && !adapter_chunk) {
-                    /* Device-side adapter buffer was appended by CUDA. */
-                    s->total_adapter += chunk_tokens;
-                } else if (adapter_chunk) {
-                    int phys_len = s->total_adapter - s->adapter_pos_offset;
-                    if (phys_len + chunk_tokens > s->adapter_cap) {
-                        int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                        while (new_cap < phys_len + chunk_tokens) new_cap *= 2;
-                        float *tmp = (float *)realloc(s->adapter_buf,
-                            (size_t)new_cap * dim * sizeof(float));
-                        if (!tmp) { free(adapter_chunk); return; }
-                        s->adapter_buf = tmp;
-                        s->adapter_cap = new_cap;
-                    }
-                    memcpy(s->adapter_buf + (size_t)phys_len * dim,
-                           adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
-                    s->total_adapter += chunk_tokens;
+            if (chunk_tokens > 0 && adapter_chunk) {
+                if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+                    int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
+                    while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                    float *tmp = (float *)realloc(s->adapter_buf,
+                        (size_t)new_cap * dim * sizeof(float));
+                    if (!tmp) { free(adapter_chunk); return; }
+                    s->adapter_buf = tmp;
+                    s->adapter_cap = new_cap;
                 }
+                memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+                       adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
+                s->total_adapter += chunk_tokens;
             }
             free(adapter_chunk);
 
@@ -933,7 +808,8 @@ static void stream_run_encoder(vox_stream_t *s) {
     if (new_mel < need_mel && !s->finished) return;
     if (new_mel <= 0) return;
 
-    double t0 = vox_get_time_ms();
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
 
     /* 1. Run incremental conv stem on new mel -> post-conv positions */
     int conv_out_len = 0;
@@ -987,18 +863,17 @@ static void stream_run_encoder(vox_stream_t *s) {
         free(combined);
 
         if (adapter_chunk && chunk_tokens > 0) {
-            /* Append to adapter buffer (physical offsets account for compaction) */
-            int phys_len = s->total_adapter - s->adapter_pos_offset;
-            if (phys_len + chunk_tokens > s->adapter_cap) {
+            /* Append to adapter buffer */
+            if (s->total_adapter + chunk_tokens > s->adapter_cap) {
                 int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                while (new_cap < phys_len + chunk_tokens) new_cap *= 2;
+                while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
                 float *tmp = (float *)realloc(s->adapter_buf,
                     (size_t)new_cap * dim * sizeof(float));
                 if (!tmp) { free(adapter_chunk); free(enc_out); return; }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
             }
-            memcpy(s->adapter_buf + (size_t)phys_len * dim,
+            memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
                    adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
             s->total_adapter += chunk_tokens;
             free(adapter_chunk);
@@ -1021,7 +896,9 @@ static void stream_run_encoder(vox_stream_t *s) {
 
     free(enc_out);
 
-    s->encoder_ms += vox_get_time_ms() - t0;
+    gettimeofday(&t1, NULL);
+    s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                     (t1.tv_usec - t0.tv_usec) / 1000.0;
 
     if (vox_verbose >= 2)
         fprintf(stderr, "  Encoder inc: %d mel -> %d conv -> %d usable (total adapter: %d, residual: %d)\n",
@@ -1089,51 +966,32 @@ static void stream_fill_alts(vox_stream_t *s, int best_token,
 
 /* Run decoder: prefill if needed, then generate tokens while adapter available */
 static void stream_run_decoder(vox_stream_t *s) {
-    double t0;
+    struct timeval t0, t1;
     int dim = VOX_DEC_DIM;
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
-    const int eos_is_terminal = (s->finished || stream_strict_eos());
+    const int eos_is_terminal = s->finished; /* EOS is only final once input is finished (offline right-pad added). */
     float *logits_out = (s->n_alt > 1) ? s->logits : NULL;
 
     /* Prefill when we have enough adapter tokens */
     if (!s->decoder_started && s->total_adapter >= prompt_len) {
-        t0 = vox_get_time_ms();
+        gettimeofday(&t0, NULL);
 
         float *prompt_embeds = (float *)malloc((size_t)prompt_len * dim * sizeof(float));
         if (!prompt_embeds) return;
 
-	        if (stream_use_cuda_pipeline_full()) {
-#ifdef USE_CUDA
-	            if (!vox_cuda_stream_adapter_copy_prompt(s->ctx, prompt_embeds, prompt_len)) {
-	                free(prompt_embeds);
-	                return;
-	            }
-#else
-            free(prompt_embeds);
-            return;
-#endif
-            for (int i = 0; i < prompt_len; i++) {
-                int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
-                tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
-                float *dst = prompt_embeds + (size_t)i * dim;
-                for (int j = 0; j < dim; j++) dst[j] += s->tok_tmp[j];
-            }
-        } else {
-            for (int i = 0; i < prompt_len; i++) {
-                int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
-                tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
-                const float *a = s->adapter_buf + (size_t)i * dim;
-                float *dst = prompt_embeds + (size_t)i * dim;
-                for (int j = 0; j < dim; j++) dst[j] = a[j] + s->tok_tmp[j];
-            }
+        for (int i = 0; i < prompt_len; i++) {
+            int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
+            tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
+            const float *a = s->adapter_buf + (size_t)i * dim;
+            float *dst = prompt_embeds + (size_t)i * dim;
+            for (int j = 0; j < dim; j++) dst[j] = a[j] + s->tok_tmp[j];
         }
 
         s->ctx->kv_cache_len = 0;
-        s->ctx->kv_cache_host_valid_len = 0;
         s->ctx->kv_pos_offset = 0;
 #ifdef USE_CUDA
-        vox_cuda_kv_cache_reset(s->ctx);
+        vox_cuda_kv_cache_reset();
 #endif
         /* Keep KV cache allocated — vox_decoder_prefill will reuse or grow it. */
 
@@ -1168,7 +1026,9 @@ static void stream_run_decoder(vox_stream_t *s) {
         s->gen_pos = prompt_len;
         s->decoder_started = 1;
 
-        double pf_ms = vox_get_time_ms() - t0;
+        gettimeofday(&t1, NULL);
+        double pf_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                       (t1.tv_usec - t0.tv_usec) / 1000.0;
         s->decoder_ms += pf_ms;
         s->prefill_ms += pf_ms;
 
@@ -1179,28 +1039,16 @@ static void stream_run_decoder(vox_stream_t *s) {
 
     /* Generate tokens while adapter tokens are available */
     if (s->decoder_started && !s->eos_seen) {
-        t0 = vox_get_time_ms();
+        gettimeofday(&t0, NULL);
         int gen_before = s->n_generated;
         while (s->gen_pos < s->total_adapter) {
-            if (stream_use_cuda_pipeline_full()) {
-#ifdef USE_CUDA
-                int tok = 2;
-                if (!vox_cuda_decoder_forward_from_stream_adapter(&tok, logits_out, s->ctx, s->prev_token)) return;
-                s->prev_token = tok;
-                s->n_generated++;
-#else
-                return;
-#endif
-            } else {
-                tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
-                int phys_pos = s->gen_pos - s->adapter_pos_offset;
-                const float *a = s->adapter_buf + (size_t)phys_pos * dim;
-                for (int j = 0; j < dim; j++)
-                    s->step_embed[j] = a[j] + s->tok_tmp[j];
+            tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
+            const float *a = s->adapter_buf + (size_t)s->gen_pos * dim;
+            for (int j = 0; j < dim; j++)
+                s->step_embed[j] = a[j] + s->tok_tmp[j];
 
-                s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
-                s->n_generated++;
-            }
+            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
+            s->n_generated++;
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
                 const char *alts[VOX_MAX_ALT];
@@ -1219,12 +1067,11 @@ static void stream_run_decoder(vox_stream_t *s) {
             }
         }
         if (s->n_generated > gen_before) {
-            s->decoder_ms += vox_get_time_ms() - t0;
+            gettimeofday(&t1, NULL);
+            s->decoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (t1.tv_usec - t0.tv_usec) / 1000.0;
         }
     }
-
-    /* Reclaim adapter buffer space for tokens the decoder has consumed */
-    stream_adapter_compact(s);
 }
 
 vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
@@ -1233,22 +1080,17 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
 
     s->ctx = ctx;
 
-#ifdef USE_CUDA
-    if (stream_use_cuda_pipeline_full()) {
-        vox_cuda_stream_adapter_reset(ctx);
-    }
-#endif
-
     /* Load tokenizer */
     char tok_path[1024];
     snprintf(tok_path, sizeof(tok_path), "%s/tekken.json", ctx->model_dir);
     s->tokenizer = vox_tokenizer_load(tok_path);
-    if (!s->tokenizer) { vox_stream_free(s); return NULL; }
+    if (!s->tokenizer) { free(s); return NULL; }
 
     /* Initialize incremental mel with 32 left-pad tokens of silence */
     s->mel_ctx = vox_mel_ctx_init(32 * RAW_AUDIO_LENGTH_PER_TOK);
     if (!s->mel_ctx) {
-        vox_stream_free(s);
+        vox_tokenizer_free(s->tokenizer);
+        free(s);
         return NULL;
     }
 
@@ -1293,7 +1135,6 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
         }
     }
 
-    s->init_ok = 1;
     return s;
 }
 
@@ -1369,7 +1210,7 @@ void vox_stream_free(vox_stream_t *s) {
     /* Print stats after caller has drained all tokens */
     const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
     int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
-    if (s->init_ok && (vox_verbose >= 1 || force_timing)) {
+    if (vox_verbose >= 1 || force_timing) {
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
         if (s->n_text_tokens > 0) {
@@ -1381,12 +1222,6 @@ void vox_stream_free(vox_stream_t *s) {
                     s->n_generated > 1 ? gen_ms / (s->n_generated - 1) : 0);
         }
     }
-
-#ifdef USE_CUDA
-    if (stream_use_cuda_pipeline_full()) {
-        vox_cuda_stream_adapter_reset(s->ctx);
-    }
-#endif
 
     vox_mel_free(s->mel_ctx);
     if (s->tokenizer) vox_tokenizer_free(s->tokenizer);
@@ -1703,13 +1538,6 @@ void vox_set_processing_interval(vox_stream_t *s, float seconds) {
     /* mel rate = sample_rate / hop_length = 16000/160 = 100 fps */
     s->min_new_mel = (int)(seconds * 100.0f);
     if (s->min_new_mel < 1) s->min_new_mel = 1;
-
-    /* CUDA chunked encoder path uses chunk_new_mel (not min_new_mel) to decide
-     * when to run. Keep it in sync unless explicitly overridden via env var. */
-    if (!s->chunk_user_override) {
-        s->chunk_new_mel = s->min_new_mel;
-        if (s->chunk_new_mel < 50) s->chunk_new_mel = 50; /* minimum 0.5s */
-    }
 }
 
 void vox_set_delay(vox_ctx_t *ctx, int delay_ms) {
