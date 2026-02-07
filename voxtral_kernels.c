@@ -327,9 +327,11 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     }
 #endif
 #ifdef USE_AVX512BF16
-    avx512bf16_check();
-    matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
-    return;
+    if (seq_len > 1) {
+        avx512bf16_check();
+        matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
+        return;
+    }
 #endif
     if (seq_len == 1) {
         bf16_matvec_fused(y, x, W_bf16, NULL, in_dim, out_dim);
@@ -358,16 +360,18 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
     }
 #endif
 #ifdef USE_AVX512BF16
-    avx512bf16_check();
-    matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
-    if (b != NULL) {
-        for (int s = 0; s < seq_len; s++) {
-            for (int o = 0; o < out_dim; o++) {
-                y[s * out_dim + o] += b[o];
+    if (seq_len > 1) {
+        avx512bf16_check();
+        matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
             }
         }
+        return;
     }
-    return;
 #endif
     if (seq_len == 1) {
         bf16_matvec_fused(y, x, W_bf16, b, in_dim, out_dim);
@@ -394,9 +398,11 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
     }
 #endif
 #ifdef USE_AVX512BF16
-    avx512bf16_check();
-    matmul_avx512bf16_tiled(C, A, B_bf16, M, N, K);
-    return;
+    if (M > 1) {
+        avx512bf16_check();
+        matmul_avx512bf16_tiled(C, A, B_bf16, M, N, K);
+        return;
+    }
 #endif
     if (M == 1) {
         bf16_matvec_fused(C, A, B_bf16, NULL, K, N);
