@@ -985,9 +985,6 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
     stream_run_encoder(s);
     stream_run_decoder(s);
 
-    if (vox_verbose >= 2) {
-        fprintf(stderr, "[DEBUG] Processed: %.2f seconds\n", (float)s->real_samples_fed / VOX_SAMPLE_RATE);
-    }
     return 0;
 }
 
@@ -1024,9 +1021,6 @@ int vox_stream_finish(vox_stream_t *s) {
     stream_run_encoder(s);
     stream_run_decoder(s);
 
-    if (vox_verbose >= 2) {
-        fprintf(stderr, "[DEBUG] Processed (final): %.2f seconds\n", (float)s->real_samples_fed / VOX_SAMPLE_RATE);
-    }
     return 0;
 }
 

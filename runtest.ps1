@@ -71,7 +71,7 @@ function Run-Test($name, $cmd, $cmdArgs) {
 }
 
 # Test 1: Batch mode
-Run-Test "batch" $VOXTRAL @("-d", $MODEL_DIR, "-i", $INPUT, "--debug")
+Run-Test "batch" $VOXTRAL @("-d", $MODEL_DIR, "-i", $INPUT)
 
 # Test 2: Streaming mode with small chunks
 Write-Host "=== Test: streaming -I 0.1 ==="
@@ -79,7 +79,7 @@ $got = ""
 if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
     # Use powershell to handle the pipe more reliably
     $ffmpeg_cmd = "ffmpeg -i ""$INPUT"" -f s16le -ar 16000 -ac 1 - 2>NUL"
-    $voxtral_cmd = "$VOXTRAL -d ""$MODEL_DIR"" --stdin -I 0.1 --debug"
+    $voxtral_cmd = "$VOXTRAL -d ""$MODEL_DIR"" --stdin -I 0.1"
     
     cmd /c "$ffmpeg_cmd | $voxtral_cmd" 2>&1 | ForEach-Object {
         $line = $_.ToString()
