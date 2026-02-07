@@ -275,7 +275,11 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
     int *pos_host = (int *)vox_cpu_malloc(seq_len * sizeof(int));
     for (int i = 0; i < seq_len; i++) pos_host[i] = logical_start + i;
-    vox_mem_copy(positions, pos_host, seq_len * sizeof(int));
+    if (ctx->backend == VOX_BACKEND_CUDA) {
+        vox_cuda_copy_to_device(positions, pos_host, seq_len * sizeof(int));
+    } else {
+        memcpy(positions, pos_host, seq_len * sizeof(int));
+    }
     vox_cpu_free(pos_host);
 
     float *rope_freqs = (float *)vox_mem_malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
@@ -465,7 +469,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     float scale = 1.0f / sqrtf((float)head_dim);
 
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (ctx->backend == VOX_BACKEND_CUDA) {
         /* Monolithic CUDA Graph path */
         int total_seq = pos + 1;
         vox_cuda_copy_to_device(ctx->cuda_d_pos, &pos, sizeof(int));

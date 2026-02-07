@@ -31,7 +31,9 @@ if (-not (Test-Path $INPUT)) {
     exit 1
 }
 
-function Check-Output($name, $got) {
+$global:SAW_CUDA = $false
+
+function Check-Output($name, $got, $requireCuda = $false) {
     $ok = $true
     # Robust check: remove punctuation from both strings
     $clean_got = $got -replace "[,.!?]", ""
@@ -41,6 +43,11 @@ function Check-Output($name, $got) {
             Write-Host "  MISSING: ""$phrase"""
             $ok = $false
         }
+    }
+
+    if ($requireCuda -and -not $global:SAW_CUDA) {
+        Write-Host "  FAIL: CUDA initialization message not found in output!"
+        $ok = $false
     }
 
     if ($ok) {
@@ -53,13 +60,17 @@ function Check-Output($name, $got) {
     Write-Host ""
 }
 
-function Run-Test($name, $cmd, $cmdArgs) {
+function Run-Test($name, $cmd, $cmdArgs, $requireCuda = $false) {
     Write-Host "=== Test: $name ==="
     $got = ""
+    $global:SAW_CUDA = $false
     # Run and stream output
     & $cmd $cmdArgs 2>&1 | ForEach-Object {
         $line = $_.ToString()
-        if ($line -match "^Loading|^Metal|^Model|^Audio:|^Encoder:|^Decoder:|^\[DEBUG\]") {
+        if ($line -match "^\[CUDA\]") {
+            $global:SAW_CUDA = $true
+            Write-Host "  [status] $line" -ForegroundColor Green
+        } elseif ($line -match "^Loading|^Metal|^Model|^Audio:|^Encoder:|^Decoder:|^\[DEBUG\]") {
             Write-Host "  [status] $line" -ForegroundColor Cyan
         } else {
             Write-Host $line -NoNewline
@@ -67,13 +78,16 @@ function Run-Test($name, $cmd, $cmdArgs) {
         }
     }
     Write-Host "`n"
-    Check-Output $name $got
+    Check-Output $name $got $requireCuda
 }
 
-# Test 1: Batch mode
-Run-Test "batch" $VOXTRAL @("-d", $MODEL_DIR, "-i", $INPUT)
+# Test 1: Batch mode (Default/CPU)
+Run-Test "batch-cpu" $VOXTRAL @("-d", $MODEL_DIR, "-i", $INPUT)
 
-# Test 2: Streaming mode with small chunks
+# Test 2: Batch mode (CUDA)
+Run-Test "batch-cuda" $VOXTRAL @("--backend", "cuda", "-d", $MODEL_DIR, "-i", $INPUT) -requireCuda $true
+
+# Test 3: Streaming mode with small chunks
 Write-Host "=== Test: streaming -I 0.1 ==="
 $got = ""
 if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {

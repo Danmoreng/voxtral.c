@@ -15,6 +15,12 @@
 typedef struct vox_cuda_ctx vox_cuda_ctx_t;
 typedef struct vox_ctx vox_ctx_t;
 
+typedef enum {
+    VOX_BACKEND_CPU = 0,
+    VOX_BACKEND_CUDA = 1,
+    VOX_BACKEND_METAL = 2
+} vox_backend_t;
+
 /* Memory management */
 /* vox_mem_* functions manage memory that MAY be accessed by GPU (managed/unified) */
 void *vox_mem_malloc(size_t size);
@@ -179,6 +185,8 @@ struct vox_ctx {
     vox_adapter_t adapter;
     vox_decoder_t decoder;
 
+    vox_backend_t backend;
+
     /* Model file (kept open for mmap) */
     void *safetensors;       /* safetensors_file_t* */
     char model_dir[512];
@@ -247,7 +255,7 @@ struct vox_ctx {
  * ======================================================================== */
 
 /* Load model from directory containing consolidated.safetensors + tekken.json */
-vox_ctx_t *vox_load(const char *model_dir);
+vox_ctx_t *vox_load(const char *model_dir, vox_backend_t backend);
 
 /* Free all resources */
 void vox_free(vox_ctx_t *ctx);

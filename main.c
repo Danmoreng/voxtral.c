@@ -34,6 +34,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>   Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>   Show alternative tokens within cutoff distance (0.0-1.0)\n");
+    fprintf(stderr, "  --backend <b> Backend to use: cpu, cuda, metal (default: cpu)\n");
     fprintf(stderr, "  --debug     Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent    No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h          Show this help\n");
@@ -124,12 +125,33 @@ int main(int argc, char **argv) {
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
     float interval = -1.0f; /* <0 means use default */
+    vox_backend_t backend = VOX_BACKEND_CPU;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             model_dir = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             input_wav = argv[++i];
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            const char *b = argv[++i];
+            if (strcmp(b, "cpu") == 0) {
+                backend = VOX_BACKEND_CPU;
+            } else if (strcmp(b, "cuda") == 0) {
+#ifndef USE_CUDA
+                fprintf(stderr, "Error: Binary compiled without CUDA support.\n");
+                return 1;
+#endif
+                backend = VOX_BACKEND_CUDA;
+            } else if (strcmp(b, "metal") == 0) {
+#ifndef USE_METAL
+                fprintf(stderr, "Error: Binary compiled without Metal support.\n");
+                return 1;
+#endif
+                backend = VOX_BACKEND_METAL;
+            } else {
+                fprintf(stderr, "Unknown backend: %s\n", b);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
             interval = (float)atof(argv[++i]);
             if (interval <= 0) {
@@ -175,7 +197,7 @@ int main(int argc, char **argv) {
 #endif
 
     /* Load model */
-    vox_ctx_t *ctx = vox_load(model_dir);
+    vox_ctx_t *ctx = vox_load(model_dir, backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);
         return 1;

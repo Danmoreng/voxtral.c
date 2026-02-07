@@ -219,7 +219,11 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
     int *pos_host = (int *)vox_cpu_malloc(seq_len * sizeof(int));
     for (int i = 0; i < seq_len; i++) pos_host[i] = i;
-    vox_mem_copy(positions, pos_host, seq_len * sizeof(int));
+    if (ctx->backend == VOX_BACKEND_CUDA) {
+        vox_cuda_copy_to_device(positions, pos_host, seq_len * sizeof(int));
+    } else {
+        memcpy(positions, pos_host, seq_len * sizeof(int));
+    }
     vox_cpu_free(pos_host);
 
     float *rope_freqs = (float *)vox_mem_malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
@@ -523,7 +527,11 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     int *positions = ctx->enc_inc_positions;
     int *pos_host = (int *)vox_cpu_malloc(new_len * sizeof(int));
     for (int i = 0; i < new_len; i++) pos_host[i] = logical_start + i;
-    vox_mem_copy(positions, pos_host, new_len * sizeof(int));
+    if (ctx->backend == VOX_BACKEND_CUDA) {
+        vox_cuda_copy_to_device(positions, pos_host, new_len * sizeof(int));
+    } else {
+        memcpy(positions, pos_host, new_len * sizeof(int));
+    }
     vox_cpu_free(pos_host);
 
     float *rope_freqs = ctx->enc_inc_rope_freqs;
@@ -682,11 +690,11 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 
 int vox_adapter_load(vox_adapter_t *ada, safetensors_file_t *sf) {
     char name[512];
-    const char *ap = "mm_streams_embeddings.embedding_module.whisper_to_llm_adapter";
+    const char *ap = "mm_streams_embeddings.embedding_module.audio_language_projection";
 
-    snprintf(name, sizeof(name), "%s.linear0.weight", ap);
+    snprintf(name, sizeof(name), "%s.0.weight", ap);
     ada->linear0_weight_bf16 = load_bf16_direct(sf, name);
-    snprintf(name, sizeof(name), "%s.linear1.weight", ap);
+    snprintf(name, sizeof(name), "%s.2.weight", ap);
     ada->linear1_weight_bf16 = load_bf16_direct(sf, name);
 
     if (!ada->linear0_weight_bf16 || !ada->linear1_weight_bf16) return -1;

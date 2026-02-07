@@ -43,9 +43,11 @@ void vox_cpu_free(void *ptr) {
 }
 
 /* vox_mem_* functions: potentially GPU-accessible device memory */
+vox_backend_t g_selected_backend = VOX_BACKEND_CPU;
+
 void *vox_gpu_malloc(size_t size) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         return vox_cuda_malloc(NULL, size);
     }
 #endif
@@ -54,7 +56,7 @@ void *vox_gpu_malloc(size_t size) {
 
 void vox_gpu_free(void *ptr) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_free(NULL, ptr);
         return;
     }
@@ -71,7 +73,7 @@ void *vox_mem_calloc(size_t count, size_t size) {
     void *ptr = vox_mem_malloc(total);
     if (ptr) {
 #ifdef USE_CUDA
-        if (vox_cuda_available()) {
+        if (g_selected_backend == VOX_BACKEND_CUDA) {
             cudaMemset(ptr, 0, total);
         } else
 #endif
@@ -82,16 +84,14 @@ void *vox_mem_calloc(size_t count, size_t size) {
 
 void *vox_mem_realloc(void *ptr, size_t size) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
-        /* CRITICAL: We cannot safely realloc managed memory without tracking old size
-           for the copy. Standard realloc on managed memory pointer will crash or corrupt.
-           Usage should be migrated to vox_cpu_realloc (CPU-only) or separate alloc/free. */
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
+        /* CRITICAL: We cannot safely realloc device memory without tracking old size
+           for the copy. Standard realloc on device memory pointer will crash or corrupt. */
         if (ptr) {
-            fprintf(stderr, "FATAL: vox_mem_realloc called on potentially CUDA-managed memory.\n");
-            fprintf(stderr, "This is not supported. Use vox_cpu_realloc for CPU-only buffers.\n");
+            fprintf(stderr, "FATAL: vox_mem_realloc called on CUDA device memory.\n");
             exit(1);
         }
-        return vox_cuda_malloc_managed(size);
+        return vox_gpu_malloc(size);
     }
 #endif
     return realloc(ptr, size);
@@ -99,18 +99,12 @@ void *vox_mem_realloc(void *ptr, size_t size) {
 
 void vox_mem_free(void *ptr) {
     if (!ptr) return;
-#ifdef USE_CUDA
-    if (vox_cuda_available()) {
-        vox_cuda_free(NULL, ptr);
-        return;
-    }
-#endif
-    free(ptr);
+    vox_gpu_free(ptr);
 }
 
 void vox_mem_copy(void *dst, const void *src, size_t size) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         cudaMemcpy(dst, src, size, cudaMemcpyDefault);
         return;
     }
@@ -141,10 +135,22 @@ static void vox_update_time_conditioning(vox_ctx_t *ctx) {
     // [Implementation details omitted for brevity, assuming loaded from weights]
 }
 
-vox_ctx_t *vox_load(const char *model_dir) {
+vox_ctx_t *vox_load(const char *model_dir, vox_backend_t backend) {
+    g_selected_backend = backend;
+
+#ifdef USE_CUDA
+    if (backend == VOX_BACKEND_CUDA) {
+        if (!vox_cuda_available()) {
+            fprintf(stderr, "Error: CUDA backend requested but no CUDA device found.\n");
+            return NULL;
+        }
+    }
+#endif
+
     vox_ctx_t *ctx = (vox_ctx_t *)vox_mem_calloc(1, sizeof(vox_ctx_t));
     if (!ctx) return NULL;
 
+    ctx->backend = backend;
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
     char path[1024];
@@ -157,7 +163,9 @@ vox_ctx_t *vox_load(const char *model_dir) {
     }
     ctx->safetensors = sf;
 
-    if (vox_verbose >= 1) printf("Loading model from %s...\n", path);
+    if (vox_verbose >= 1) printf("Loading model from %s (Backend: %s)...\n", 
+                                path, backend == VOX_BACKEND_CUDA ? "CUDA" : 
+                                      (backend == VOX_BACKEND_METAL ? "Metal" : "CPU"));
 
     /* Load Encoder Weights */
     if (vox_encoder_load(&ctx->encoder, sf) != 0) {
@@ -189,7 +197,7 @@ vox_ctx_t *vox_load(const char *model_dir) {
     vox_update_time_conditioning(ctx);
 
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (backend == VOX_BACKEND_CUDA) {
         ctx->cuda_ctx = vox_cuda_init();
     }
 #endif

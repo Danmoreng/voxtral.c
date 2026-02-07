@@ -217,11 +217,13 @@ void vox_cuda_kv_cache_update(vox_cuda_ctx_t *ctx, float *cache_k, float *cache_
 }
 
 void vox_cuda_copy_to_device(void *dst, const void *src, size_t size) {
-    CUDA_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice));
+    if (size == 0) return;
+    cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
 }
 
 void vox_cuda_copy_to_host(void *dst, const void *src, size_t size) {
-    CUDA_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost));
+    if (size == 0) return;
+    cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
 }
 
 __global__ void k_f32_to_bf16(nv_bfloat16 *out, const float *in, int n) {

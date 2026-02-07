@@ -13,6 +13,8 @@
 #include <string.h>
 #include <fcntl.h>
 
+extern vox_backend_t g_selected_backend;
+
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -223,7 +225,7 @@ static int parse_header(safetensors_file_t *sf) {
 
 safetensors_file_t *safetensors_open(const char *path) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         FILE *fp = fopen(path, "rb");
         if (!fp) { perror("safetensors_open: fopen failed"); return NULL; }
 #ifdef _WIN32
@@ -249,7 +251,11 @@ safetensors_file_t *safetensors_open(const char *path) {
 
         void *gpu_data = vox_gpu_malloc(file_size);
         if (!gpu_data) { vox_cpu_free(host_data); return NULL; }
-        vox_mem_copy(gpu_data, host_data, file_size);
+        if (g_selected_backend == VOX_BACKEND_CUDA) {
+            vox_cuda_copy_to_device(gpu_data, host_data, file_size);
+        } else {
+            memcpy(gpu_data, host_data, file_size);
+        }
 
         /* Parse Header Size */
         uint64_t header_size = 0;
@@ -300,7 +306,7 @@ safetensors_file_t *safetensors_open(const char *path) {
     int use_mmap = 1;
 
 #ifdef USE_CUDA
-    if (vox_cuda_available()) use_mmap = 0;
+    if (g_selected_backend == VOX_BACKEND_CUDA) use_mmap = 0;
 #endif
 
     if (!use_mmap) {
