@@ -138,6 +138,12 @@ void vox_mul_inplace(float *a, const float *b, int n) {
 }
 
 void vox_axpy(float *a, float scale, const float *b, int n) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_axpy(a, scale, b, n);
+        return;
+    }
+#endif
     int i = 0;
     /* TODO: CUDA axpy kernel */
 #if defined(USE_AVX512BF16)
@@ -414,7 +420,7 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
 void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
-    if (vox_cuda_available() && seq_len > 1) {
+    if (vox_cuda_available()) {
         vox_cuda_matmul_t_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
         return;
     }
@@ -450,14 +456,10 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                      const float *b, int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
-    if (vox_cuda_available() && seq_len > 1) {
+    if (vox_cuda_available()) {
         vox_cuda_matmul_t_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
         if (b != NULL) {
-            for (int s = 0; s < seq_len; s++) {
-                for (int o = 0; o < out_dim; o++) {
-                    y[s * out_dim + o] += b[o];
-                }
-            }
+            vox_cuda_bias_add(y, b, seq_len, out_dim);
         }
         return;
     }
@@ -585,6 +587,12 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
     int out_length = (int)ceilf(n_frames);
     if (out_length <= 0) return;
 
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_causal_conv1d(out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
+        return;
+    }
+#endif
     int left_pad = padding_total;
     int K = channels_in * kernel_size;
 
@@ -735,6 +743,12 @@ static inline __m256 exp256_ps(__m256 x) {
 #endif
 
 void vox_silu(float *x, int n) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_silu(x, n);
+        return;
+    }
+#endif
     int i = 0;
 #if defined(USE_AVX512BF16)
     __m512 one512 = _mm512_set1_ps(1.0f);
@@ -760,6 +774,12 @@ void vox_silu(float *x, int n) {
 }
 
 void vox_gelu(float *x, int n) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_gelu(x, n);
+        return;
+    }
+#endif
     int i = 0;
 #if defined(USE_AVX512BF16)
     __m512 half512 = _mm512_set1_ps(0.5f);
@@ -835,6 +855,12 @@ void vox_causal_attention(float *out, const float *Q, const float *K, const floa
                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
                           int head_dim, float scale, int window_size,
                           int q_offset) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_causal_attention(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
+        return;
+    }
+#endif
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
@@ -924,6 +950,12 @@ void vox_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, floa
 }
 
 void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_dim) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_rope(x, freqs, seq, heads, head_dim);
+        return;
+    }
+#endif
     /* x: [seq, heads * head_dim]
      * freqs: [seq, head_dim/2, 2] (cos, sin pairs)
      * Apply rotary embedding to consecutive pairs */

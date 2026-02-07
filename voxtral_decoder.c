@@ -19,6 +19,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -419,7 +422,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     float *ffn_out = ctx->dec_ffn_out;
     float *rope_freqs = ctx->dec_rope_freqs;
 
-    memcpy(x, input_embeds, dim * sizeof(float));
+    vox_mem_copy(x, input_embeds, dim * sizeof(float));
 
     int pos = ctx->kv_cache_len;
 
@@ -468,8 +471,8 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
         vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
 
-        memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
-        memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
+        vox_mem_copy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
+        vox_mem_copy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
 
         int total_seq = pos + 1;
         float *full_k = kv_cache_k_at(ctx, layer, 0);
@@ -485,7 +488,14 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
         if (ctx->ada_scale) {
             const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
-            for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
+#ifdef USE_CUDA
+            if (vox_cuda_available()) {
+                vox_cuda_ada_scale(x_norm, ada_s, dim);
+            } else
+#endif
+            {
+                for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
+            }
         }
 
         vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);

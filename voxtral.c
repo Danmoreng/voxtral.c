@@ -14,6 +14,7 @@
 #include "voxtral_metal.h"
 #endif
 #ifdef USE_CUDA
+#include <cuda_runtime.h>
 #include "voxtral_cuda.h"
 #endif
 #include <stdio.h>
@@ -103,7 +104,25 @@ void vox_mem_free(void *ptr) {
         return;
     }
 #endif
-    vox_mem_free(ptr);
+    free(ptr);
+}
+
+void vox_mem_copy(void *dst, const void *src, size_t size) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        /* cudaMemcpyDefault automatically handles host/device pointers with Unified Memory */
+        cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+        return;
+    }
+#endif
+    memcpy(dst, src, size);
+}
+
+char *vox_strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *d = (char *)vox_mem_malloc(len);
+    if (d) memcpy(d, s, len);
+    return d;
 }
 
 #ifdef _WIN32

@@ -164,6 +164,10 @@ if ($CC -eq "gcc") {
         }
         
         $CFLAGS += "/DUSE_CUDA"
+        if ($env:CUDA_PATH) {
+            $CUDA_INC_PATH = Join-Path $env:CUDA_PATH "include"
+            $CFLAGS += "/I`"$CUDA_INC_PATH`""
+        }
         $SRCS += "voxtral_cuda.obj"
         $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cudart.lib cublas.lib"
     }

@@ -19,6 +19,7 @@
  */
 
 #include "voxtral_audio.h"
+#include "voxtral.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +86,7 @@ float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_sa
 
     int n_frames = pcm_size / (channels * 2);
 
-    float *samples = (float *)malloc(n_frames * sizeof(float));
+    float *samples = (float *)vox_mem_malloc(n_frames * sizeof(float));
     if (!samples) return NULL;
 
     const int16_t *src = (const int16_t *)pcm_data;
@@ -106,9 +107,9 @@ float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_sa
     /* Resample to 16kHz if needed */
     if (sample_rate != SAMPLE_RATE) {
         int new_n = (int)((long long)n_frames * SAMPLE_RATE / sample_rate);
-        float *resampled = (float *)malloc(new_n * sizeof(float));
+        float *resampled = (float *)vox_mem_malloc(new_n * sizeof(float));
         if (!resampled) {
-            free(samples);
+            vox_mem_free(samples);
             return NULL;
         }
 
@@ -123,7 +124,7 @@ float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_sa
             }
         }
 
-        free(samples);
+        vox_mem_free(samples);
         samples = resampled;
         n_frames = new_n;
 
@@ -149,16 +150,16 @@ float *vox_load_wav(const char *path, int *out_n_samples) {
     if (file_size <= 0) { fclose(f); return NULL; }
     fseek(f, 0, SEEK_SET);
 
-    uint8_t *data = (uint8_t *)malloc(file_size);
+    uint8_t *data = (uint8_t *)vox_mem_malloc(file_size);
     if (!data || fread(data, 1, file_size, f) != (size_t)file_size) {
         fclose(f);
-        free(data);
+        vox_mem_free(data);
         return NULL;
     }
     fclose(f);
 
     float *samples = vox_parse_wav_buffer(data, (size_t)file_size, out_n_samples);
-    free(data);
+    vox_mem_free(data);
     return samples;
 }
 
@@ -166,14 +167,14 @@ float *vox_read_pcm_stdin(int *out_n_samples) {
     /* Read all of stdin into a growing buffer */
     size_t capacity = 1024 * 1024; /* 1 MB initial */
     size_t size = 0;
-    uint8_t *buf = (uint8_t *)malloc(capacity);
+    uint8_t *buf = (uint8_t *)vox_mem_malloc(capacity);
     if (!buf) return NULL;
 
     while (1) {
         if (size == capacity) {
             capacity *= 2;
-            uint8_t *tmp = (uint8_t *)realloc(buf, capacity);
-            if (!tmp) { free(buf); return NULL; }
+            uint8_t *tmp = (uint8_t *)vox_mem_realloc(buf, capacity);
+            if (!tmp) { vox_mem_free(buf); return NULL; }
             buf = tmp;
         }
         size_t n = fread(buf + size, 1, capacity - size, stdin);
@@ -183,7 +184,7 @@ float *vox_read_pcm_stdin(int *out_n_samples) {
 
     if (size < 4) {
         fprintf(stderr, "vox_read_pcm_stdin: no data on stdin\n");
-        free(buf);
+        vox_mem_free(buf);
         return NULL;
     }
 
@@ -193,22 +194,22 @@ float *vox_read_pcm_stdin(int *out_n_samples) {
     if (memcmp(buf, "RIFF", 4) == 0) {
         fprintf(stderr, "Detected WAV format on stdin\n");
         float *samples = vox_parse_wav_buffer(buf, size, out_n_samples);
-        free(buf);
+        vox_mem_free(buf);
         return samples;
     }
 
     /* Treat as raw s16le 16kHz mono */
     fprintf(stderr, "Treating stdin as raw s16le 16kHz mono\n");
     int n_frames = (int)(size / 2);
-    float *samples = (float *)malloc(n_frames * sizeof(float));
-    if (!samples) { free(buf); return NULL; }
+    float *samples = (float *)vox_mem_malloc(n_frames * sizeof(float));
+    if (!samples) { vox_mem_free(buf); return NULL; }
 
     const int16_t *src = (const int16_t *)buf;
     for (int i = 0; i < n_frames; i++) {
         samples[i] = src[i] / 32768.0f;
     }
 
-    free(buf);
+    vox_mem_free(buf);
     *out_n_samples = n_frames;
     return samples;
 }
@@ -243,7 +244,7 @@ static float mel_to_hertz(float mels) {
 
 /* Build mel filter bank: [N_MEL, N_FREQ] */
 static float *build_mel_filters(void) {
-    float *filters = (float *)calloc((size_t)N_MEL * N_FREQ, sizeof(float));
+    float *filters = (float *)vox_mem_calloc((size_t)N_MEL * N_FREQ, sizeof(float));
     if (!filters) return NULL;
 
     /* FFT bin center frequencies (0..8000 inclusive) */
@@ -295,7 +296,7 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
 
     /* Reflect-pad the signal */
     int padded_len = n_samples + 2 * pad_len;
-    float *padded = (float *)malloc(padded_len * sizeof(float));
+    float *padded = (float *)vox_mem_malloc(padded_len * sizeof(float));
 
     /* Left reflect pad: samples[pad_len..1] (reversed, excluding samples[0]) */
     for (int i = 0; i < pad_len; i++) {
@@ -315,14 +316,14 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
     int n_frames = n_frames_total - 1;
     if (n_frames <= 0) {
         fprintf(stderr, "vox_mel_spectrogram: audio too short (%d samples)\n", n_samples);
-        free(padded);
+        vox_mem_free(padded);
         return NULL;
     }
 
     /* Build mel filter bank */
     float *mel_filters = build_mel_filters();
     if (!mel_filters) {
-        free(padded);
+        vox_mem_free(padded);
         return NULL;
     }
 
@@ -333,8 +334,8 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
     }
 
     /* Precompute DFT cos/sin tables: [k * N_FFT + n] = cos/sin(2*pi*k*n/N_FFT) */
-    float *dft_cos = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
-    float *dft_sin = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    float *dft_cos = (float *)vox_mem_malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    float *dft_sin = (float *)vox_mem_malloc((size_t)N_FREQ * N_FFT * sizeof(float));
     for (int k = 0; k < N_FREQ; k++) {
         for (int n = 0; n < N_FFT; n++) {
             float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)N_FFT;
@@ -344,7 +345,7 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
     }
 
     /* Allocate output: [n_frames, N_MEL] */
-    float *mel = (float *)calloc(n_frames * N_MEL, sizeof(float));
+    float *mel = (float *)vox_mem_calloc(n_frames * N_MEL, sizeof(float));
 
     /* Working buffers */
     float windowed[N_FFT];
@@ -386,10 +387,10 @@ float *vox_mel_spectrogram(const float *samples, int n_samples, int *out_frames)
         }
     }
 
-    free(dft_cos);
-    free(dft_sin);
-    free(padded);
-    free(mel_filters);
+    vox_mem_free(dft_cos);
+    vox_mem_free(dft_sin);
+    vox_mem_free(padded);
+    vox_mem_free(mel_filters);
 
     *out_frames = n_frames;
     return mel;
@@ -437,7 +438,7 @@ static int mel_compute_available(vox_mel_ctx_t *ctx) {
         /* Ensure mel buffer capacity */
         if (t >= ctx->mel_cap) {
             int new_cap = ctx->mel_cap ? ctx->mel_cap * 2 : 1024;
-            float *tmp = (float *)realloc(ctx->mel,
+            float *tmp = (float *)vox_mem_realloc(ctx->mel,
                 (size_t)new_cap * N_MEL * sizeof(float));
             if (!tmp) break;
             ctx->mel = tmp;
@@ -482,19 +483,19 @@ static int mel_compute_available(vox_mel_ctx_t *ctx) {
 }
 
 vox_mel_ctx_t *vox_mel_ctx_init(int left_pad_samples) {
-    vox_mel_ctx_t *ctx = (vox_mel_ctx_t *)calloc(1, sizeof(vox_mel_ctx_t));
+    vox_mel_ctx_t *ctx = (vox_mel_ctx_t *)vox_mem_calloc(1, sizeof(vox_mel_ctx_t));
     if (!ctx) return NULL;
 
     /* Build mel filters */
     ctx->mel_filters = build_mel_filters();
-    if (!ctx->mel_filters) { free(ctx); return NULL; }
+    if (!ctx->mel_filters) { vox_mem_free(ctx); return NULL; }
 
     /* Precompute DFT cos/sin tables */
-    ctx->dft_cos = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
-    ctx->dft_sin = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    ctx->dft_cos = (float *)vox_mem_malloc((size_t)N_FREQ * N_FFT * sizeof(float));
+    ctx->dft_sin = (float *)vox_mem_malloc((size_t)N_FREQ * N_FFT * sizeof(float));
     if (!ctx->dft_cos || !ctx->dft_sin) {
-        free(ctx->dft_cos); free(ctx->dft_sin);
-        free(ctx->mel_filters); free(ctx);
+        vox_mem_free(ctx->dft_cos); vox_mem_free(ctx->dft_sin);
+        vox_mem_free(ctx->mel_filters); vox_mem_free(ctx);
         return NULL;
     }
     for (int k = 0; k < N_FREQ; k++) {
@@ -515,10 +516,10 @@ vox_mel_ctx_t *vox_mel_ctx_init(int left_pad_samples) {
 
     /* Allocate initial sample buffer with left padding (all zeros) */
     ctx->samples_cap = ctx->left_pad + 16000; /* room for ~1s of audio */
-    ctx->samples = (float *)calloc((size_t)ctx->samples_cap, sizeof(float));
+    ctx->samples = (float *)vox_mem_calloc((size_t)ctx->samples_cap, sizeof(float));
     if (!ctx->samples) {
-        free(ctx->mel_filters);
-        free(ctx);
+        vox_mem_free(ctx->mel_filters);
+        vox_mem_free(ctx);
         return NULL;
     }
     ctx->n_samples = ctx->left_pad; /* starts with zeros */
@@ -534,7 +535,7 @@ int vox_mel_feed(vox_mel_ctx_t *ctx, const float *samples, int n_samples) {
     if (needed > ctx->samples_cap) {
         int new_cap = ctx->samples_cap;
         while (new_cap < needed) new_cap *= 2;
-        float *tmp = (float *)realloc(ctx->samples, (size_t)new_cap * sizeof(float));
+        float *tmp = (float *)vox_mem_realloc(ctx->samples, (size_t)new_cap * sizeof(float));
         if (!tmp) return 0;
         ctx->samples = tmp;
         ctx->samples_cap = new_cap;
@@ -557,7 +558,7 @@ int vox_mel_finish(vox_mel_ctx_t *ctx, int right_pad_samples) {
         if (needed > ctx->samples_cap) {
             int new_cap = ctx->samples_cap;
             while (new_cap < needed) new_cap *= 2;
-            float *tmp = (float *)realloc(ctx->samples, (size_t)new_cap * sizeof(float));
+            float *tmp = (float *)vox_mem_realloc(ctx->samples, (size_t)new_cap * sizeof(float));
             if (!tmp) return ctx->n_mel_frames;
             ctx->samples = tmp;
             ctx->samples_cap = new_cap;
@@ -573,7 +574,7 @@ int vox_mel_finish(vox_mel_ctx_t *ctx, int right_pad_samples) {
     if (needed2 > ctx->samples_cap) {
         int new_cap = ctx->samples_cap;
         while (new_cap < needed2) new_cap *= 2;
-        float *tmp = (float *)realloc(ctx->samples, (size_t)new_cap * sizeof(float));
+        float *tmp = (float *)vox_mem_realloc(ctx->samples, (size_t)new_cap * sizeof(float));
         if (!tmp) return ctx->n_mel_frames;
         ctx->samples = tmp;
         ctx->samples_cap = new_cap;
@@ -607,10 +608,10 @@ float *vox_mel_data(vox_mel_ctx_t *ctx, int *out_n_frames) {
 
 void vox_mel_free(vox_mel_ctx_t *ctx) {
     if (!ctx) return;
-    free(ctx->mel_filters);
-    free(ctx->dft_cos);
-    free(ctx->dft_sin);
-    free(ctx->samples);
-    free(ctx->mel);
-    free(ctx);
+    vox_mem_free(ctx->mel_filters);
+    vox_mem_free(ctx->dft_cos);
+    vox_mem_free(ctx->dft_sin);
+    vox_mem_free(ctx->samples);
+    vox_mem_free(ctx->mel);
+    vox_mem_free(ctx);
 }

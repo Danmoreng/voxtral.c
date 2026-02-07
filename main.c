@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
     vox_stream_t *s = vox_stream_init(ctx);
     if (!s) {
         fprintf(stderr, "Failed to init stream\n");
-        vox_free(ctx);
+        vox_mem_free(ctx);
         return 1;
     }
     if (alt_cutoff >= 0)
@@ -208,7 +208,7 @@ int main(int argc, char **argv) {
         if (hdr_read < 4) {
             fprintf(stderr, "Not enough data on stdin\n");
             vox_stream_free(s);
-            vox_free(ctx);
+            vox_mem_free(ctx);
             return 1;
         }
 
@@ -216,15 +216,15 @@ int main(int argc, char **argv) {
             /* WAV on stdin: buffer all, parse, feed in chunks */
             size_t capacity = 1024 * 1024;
             size_t size = 4;
-            uint8_t *buf = (uint8_t *)malloc(capacity);
-            if (!buf) { vox_stream_free(s); vox_free(ctx); return 1; }
+            uint8_t *buf = (uint8_t *)vox_mem_malloc(capacity);
+            if (!buf) { vox_stream_free(s); vox_mem_free(ctx); return 1; }
             memcpy(buf, hdr, 4);
 
             while (1) {
                 if (size == capacity) {
                     capacity *= 2;
-                    uint8_t *tmp = (uint8_t *)realloc(buf, capacity);
-                    if (!tmp) { free(buf); vox_stream_free(s); vox_free(ctx); return 1; }
+                    uint8_t *tmp = (uint8_t *)vox_mem_realloc(buf, capacity);
+                    if (!tmp) { vox_mem_free(buf); vox_stream_free(s); vox_mem_free(ctx); return 1; }
                     buf = tmp;
                 }
                 size_t n = fread(buf + size, 1, capacity - size, stdin);
@@ -234,11 +234,11 @@ int main(int argc, char **argv) {
 
             int n_samples = 0;
             float *samples = vox_parse_wav_buffer(buf, size, &n_samples);
-            free(buf);
+            vox_mem_free(buf);
             if (!samples) {
                 fprintf(stderr, "Invalid WAV data on stdin\n");
                 vox_stream_free(s);
-                vox_free(ctx);
+                vox_mem_free(ctx);
                 return 1;
             }
             if (vox_verbose >= 1)
@@ -246,7 +246,7 @@ int main(int argc, char **argv) {
                         n_samples, (float)n_samples / VOX_SAMPLE_RATE);
 
             feed_and_drain(s, samples, n_samples);
-            free(samples);
+            vox_mem_free(samples);
         } else {
             /* Raw s16le 16kHz mono: stream incrementally */
             if (vox_verbose >= 2)
@@ -278,7 +278,7 @@ int main(int argc, char **argv) {
         if (!samples) {
             fprintf(stderr, "Failed to load %s\n", input_wav);
             vox_stream_free(s);
-            vox_free(ctx);
+            vox_mem_free(ctx);
             return 1;
         }
         if (vox_verbose >= 1)
@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
                     n_samples, (float)n_samples / VOX_SAMPLE_RATE);
 
         feed_and_drain(s, samples, n_samples);
-        free(samples);
+        vox_mem_free(samples);
     }
 
     vox_stream_finish(s);
@@ -295,7 +295,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     vox_stream_free(s);
-    vox_free(ctx);
+    vox_mem_free(ctx);
 #ifdef USE_METAL
     vox_metal_shutdown();
 #endif

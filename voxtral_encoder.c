@@ -18,6 +18,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,9 +150,16 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     /* ---- Conv stem ---- */
     /* mel: [mel_frames, 128] -> transpose to [128, mel_frames] for conv1d */
     float *conv_in = (float *)vox_mem_malloc(VOX_MEL_BINS * mel_frames * sizeof(float));
-    for (int f = 0; f < mel_frames; f++) {
-        for (int m = 0; m < VOX_MEL_BINS; m++) {
-            conv_in[m * mel_frames + f] = mel[f * VOX_MEL_BINS + m];
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_transpose_mel(conv_in, mel, mel_frames, VOX_MEL_BINS);
+    } else
+#endif
+    {
+        for (int f = 0; f < mel_frames; f++) {
+            for (int m = 0; m < VOX_MEL_BINS; m++) {
+                conv_in[m * mel_frames + f] = mel[f * VOX_MEL_BINS + m];
+            }
         }
     }
 
@@ -173,9 +183,16 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
     /* Transpose: [1280, seq_len] -> [seq_len, 1280] */
     float *x = (float *)vox_mem_malloc(seq_len * dim * sizeof(float));
-    for (int s = 0; s < seq_len; s++) {
-        for (int d = 0; d < dim; d++) {
-            x[s * dim + d] = conv1_out[d * seq_len + s];
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_transpose_conv(x, conv1_out, seq_len, dim);
+    } else
+#endif
+    {
+        for (int s = 0; s < seq_len; s++) {
+            for (int d = 0; d < dim; d++) {
+                x[s * dim + d] = conv1_out[d * seq_len + s];
+            }
         }
     }
     vox_mem_free(conv1_out);
@@ -476,7 +493,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     /* Output/working state for new positions */
     float *x = (float *)vox_mem_malloc((size_t)new_len * dim * sizeof(float));
     if (!x) { *out_len = 0; return NULL; }
-    memcpy(x, x_new, (size_t)new_len * dim * sizeof(float));
+    vox_mem_copy(x, x_new, (size_t)new_len * dim * sizeof(float));
 
     if (enc_inc_ensure_buffers(ctx, new_len) != 0) {
         vox_mem_free(x);
@@ -547,12 +564,8 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         vox_apply_rope(k, rope_freqs, new_len, n_heads, head_dim);
 
         /* Copy new K, V into cache */
-        for (int s = 0; s < new_len; s++) {
-            memcpy(enc_kv_cache_k_at(ctx, layer, cache_len + s),
-                   k + (size_t)s * qkv_dim, qkv_dim * sizeof(float));
-            memcpy(enc_kv_cache_v_at(ctx, layer, cache_len + s),
-                   v + (size_t)s * qkv_dim, qkv_dim * sizeof(float));
-        }
+        vox_mem_copy(enc_kv_cache_k_at(ctx, layer, cache_len), k, (size_t)new_len * qkv_dim * sizeof(float));
+        vox_mem_copy(enc_kv_cache_v_at(ctx, layer, cache_len), v, (size_t)new_len * qkv_dim * sizeof(float));
 
         /* Attention: q=[new_len], kv=[cache_len + new_len] */
         int total_kv = cache_len + new_len;

@@ -252,7 +252,7 @@ safetensors_file_t *safetensors_open(const char *path) {
         memcpy(&header_size, data, 8);
         
         safetensors_file_t *sf = vox_mem_calloc(1, sizeof(safetensors_file_t));
-        sf->path = strdup(path);
+        sf->path = vox_strdup(path);
         sf->data = data;
         sf->file_size = file_size;
         sf->header_size = (size_t)header_size;
@@ -379,7 +379,7 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
-    sf->path = strdup(path);
+    sf->path = vox_strdup(path);
     sf->data = data;
     sf->file_size = file_size;
     sf->header_size = (size_t)header_size;

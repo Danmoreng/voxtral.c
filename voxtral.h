@@ -16,6 +16,8 @@ void *vox_mem_malloc(size_t size);
 void *vox_mem_calloc(size_t count, size_t size);
 void *vox_mem_realloc(void *ptr, size_t size);
 void vox_mem_free(void *ptr);
+void vox_mem_copy(void *dst, const void *src, size_t size);
+char *vox_strdup(const char *s);
 
 /* ========================================================================
  * Model Constants

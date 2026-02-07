@@ -198,6 +198,261 @@ void vox_cuda_mul_inplace(float *a, const float *b, int n) {
     cudaDeviceSynchronize();
 }
 
+void vox_cuda_axpy(float *a, float scale, const float *b, int n) {
+    float alpha = scale;
+    cublasStatus_t status = cublasSaxpy(g_cublas_handle, n, &alpha, b, 1, a, 1);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cublasSaxpy failed: status=%d\n", status);
+        exit(1);
+    }
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_bias_add(float *y, const float *b, int seq_len, int out_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * out_dim;
+    if (i < total) {
+        y[i] += b[i % out_dim];
+    }
+}
+
+void vox_cuda_bias_add(float *y, const float *b, int seq_len, int out_dim) {
+    int total = seq_len * out_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_bias_add<<<blocks, threads>>>(y, b, seq_len, out_dim);
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_rope(float *x, const float *freqs, int seq, int heads, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_dim = head_dim / 2;
+    int total = seq * heads * half_dim;
+    if (i < total) {
+        int s = i / (heads * half_dim);
+        int h = (i / half_dim) % heads;
+        int d = i % half_dim;
+
+        float cos_val = freqs[s * half_dim * 2 + d * 2];
+        float sin_val = freqs[s * half_dim * 2 + d * 2 + 1];
+
+        int base = s * heads * head_dim + h * head_dim + d * 2;
+        float x0 = x[base];
+        float x1 = x[base + 1];
+
+        x[base] = x0 * cos_val - x1 * sin_val;
+        x[base + 1] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+void vox_cuda_rope(float *x, const float *freqs, int seq, int heads, int head_dim) {
+    int half_dim = head_dim / 2;
+    int total = seq * heads * half_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_rope<<<blocks, threads>>>(x, freqs, seq, heads, head_dim);
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
+                                int channels_in, int channels_out, int length, int out_length,
+                                int kernel_size, int stride) {
+    int ol = blockIdx.x * blockDim.x + threadIdx.x;
+    int co = blockIdx.y;
+    
+    if (ol < out_length && co < channels_out) {
+        int left_pad = kernel_size - stride;
+        float sum = (bias) ? bias[co] : 0.0f;
+        int K = channels_in * kernel_size;
+        
+        for (int ci = 0; ci < channels_in; ci++) {
+            for (int k = 0; k < kernel_size; k++) {
+                int il = ol * stride - left_pad + k;
+                if (il >= 0 && il < length) {
+                    sum += in[ci * length + il] * weight[co * K + ci * kernel_size + k];
+                }
+            }
+        }
+        out[co * out_length + ol] = sum;
+    }
+}
+
+void vox_cuda_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
+                            int channels_in, int channels_out, int length, int out_length,
+                            int kernel_size, int stride) {
+    dim3 threads(256);
+    dim3 blocks((out_length + 255) / 256, channels_out);
+    k_causal_conv1d<<<blocks, threads>>>(out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_causal_attention_prefill(float *out, const float *Q, const float *K, const float *V,
+                                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                           int head_dim, float scale, int window_size, int q_offset) {
+    int h = blockIdx.x;
+    int qi = blockIdx.y;
+    int tid = threadIdx.x;
+    
+    if (h < n_heads && qi < seq_q && tid < head_dim) {
+        int heads_per_kv = n_heads / n_kv_heads;
+        int kv_h = h / heads_per_kv;
+        int q_hidden = n_heads * head_dim;
+        int kv_hidden = n_kv_heads * head_dim;
+        
+        const float *q_row = Q + qi * q_hidden + h * head_dim;
+        float *o_row = out + qi * q_hidden + h * head_dim;
+        
+        int global_pos = q_offset + qi;
+        int k_start = (window_size > 0 && global_pos - window_size + 1 > 0) ? global_pos - window_size + 1 : 0;
+        int k_end = (global_pos + 1 < seq_k) ? global_pos + 1 : seq_k;
+        
+        float max_score = -1e30f;
+        float sum_exp = 0.0f;
+        float acc = 0.0f;
+        
+        for (int j = k_start; j < k_end; j++) {
+            const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
+            
+            /* Each thread computes its part of dot product, but we need full dot product for softmax.
+               This is still slow because of serial dot product per thread. 
+               Better: use shared memory for dot product reduction.
+            */
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                score += q_row[d] * k_row[d];
+            }
+            score *= scale;
+            
+            const float *v_row = V + (size_t)j * kv_hidden + kv_h * head_dim;
+            float old_max = max_score;
+            if (score > max_score) {
+                max_score = score;
+                float correction = expf(old_max - max_score);
+                sum_exp = sum_exp * correction + 1.0f;
+                acc = acc * correction + v_row[tid];
+            } else {
+                float weight = expf(score - max_score);
+                sum_exp += weight;
+                acc += weight * v_row[tid];
+            }
+        }
+        o_row[tid] = acc / (sum_exp + 1e-10f);
+    }
+}
+
+__global__ void k_causal_attention_decode(float *out, const float *Q, const float *K, const float *V,
+                                          int seq_k, int n_heads, int n_kv_heads,
+                                          int head_dim, float scale, int window_size, int q_pos) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (h < n_heads && tid < head_dim) {
+        int heads_per_kv = n_heads / n_kv_heads;
+        int kv_h = h / heads_per_kv;
+        int kv_hidden = n_kv_heads * head_dim;
+        
+        const float *q_row = Q + h * head_dim;
+        float *o_row = out + h * head_dim;
+        
+        int k_start = (window_size > 0 && q_pos - window_size + 1 > 0) ? q_pos - window_size + 1 : 0;
+        int k_end = q_pos + 1;
+        if (k_end > seq_k) k_end = seq_k;
+        
+        float max_score = -1e30f;
+        float sum_exp = 0.0f;
+        float acc = 0.0f;
+        
+        for (int j = k_start; j < k_end; j++) {
+            const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                score += q_row[d] * k_row[d];
+            }
+            score *= scale;
+            
+            const float *v_row = V + (size_t)j * kv_hidden + kv_h * head_dim;
+            float old_max = max_score;
+            if (score > max_score) {
+                max_score = score;
+                float correction = expf(old_max - max_score);
+                sum_exp = sum_exp * correction + 1.0f;
+                acc = acc * correction + v_row[tid];
+            } else {
+                float weight = expf(score - max_score);
+                sum_exp += weight;
+                acc += weight * v_row[tid];
+            }
+        }
+        o_row[tid] = acc / (sum_exp + 1e-10f);
+    }
+}
+
+void vox_cuda_causal_attention(float *out, const float *Q, const float *K, const float *V,
+                               int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                               int head_dim, float scale, int window_size, int q_offset) {
+    if (seq_q == 1) {
+        dim3 blocks(n_heads);
+        dim3 threads(head_dim);
+        k_causal_attention_decode<<<blocks, threads>>>(out, Q, K, V, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
+    } else {
+        dim3 blocks(n_heads, seq_q);
+        dim3 threads(head_dim);
+        k_causal_attention_prefill<<<blocks, threads>>>(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_ada_scale(float *x, const float *scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] *= (1.0f + scale[i]);
+    }
+}
+
+void vox_cuda_ada_scale(float *x, const float *scale, int n) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    k_ada_scale<<<blocks, threads>>>(x, scale, n);
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_transpose_mel(float *out, const float *in, int frames, int bins) {
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    int m = blockIdx.y;
+    if (f < frames && m < bins) {
+        out[m * frames + f] = in[f * bins + m];
+    }
+}
+
+void vox_cuda_transpose_mel(float *out, const float *in, int frames, int bins) {
+    dim3 threads(256);
+    dim3 blocks((frames + 255) / 256, bins);
+    k_transpose_mel<<<blocks, threads>>>(out, in, frames, bins);
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
+__global__ void k_transpose_conv(float *out, const float *in, int seq_len, int dim) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = blockIdx.y;
+    if (s < seq_len && d < dim) {
+        out[s * dim + d] = in[d * seq_len + s];
+    }
+}
+
+void vox_cuda_transpose_conv(float *out, const float *in, int seq_len, int dim) {
+    dim3 threads(256);
+    dim3 blocks((seq_len + 255) / 256, dim);
+    k_transpose_conv<<<blocks, threads>>>(out, in, seq_len, dim);
+    CUDA_CHECK(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+
 void vox_cuda_sgemm(int m, int n, int k, const float *a, const float *b, float *c) {
     float alpha = 1.0f;
     float beta = 0.0f;
