@@ -27,6 +27,49 @@
 
 #ifdef USE_AVX512BF16
 #include "voxtral_avx512.h"
+/* Fast vectorized exp approximation for SiLU/GELU (AVX-512) */
+static inline __m512 exp512_ps(__m512 x) {
+    static const __m512 log2e = {1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
+                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
+                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
+                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f};
+    static const __m512 c1 = {0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f,
+                              0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f};
+    static const __m512 c2 = {-2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f,
+                              -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f};
+    static const __m512 p0 = {1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f,
+                              1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f};
+    static const __m512 p1 = {1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f,
+                              1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f};
+    static const __m512 p2 = {8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f,
+                              8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f};
+    static const __m512 p3 = {4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f,
+                              4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f};
+    static const __m512 p4 = {1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f,
+                              1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f};
+    static const __m512 p5 = {5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f,
+                              5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f};
+
+    __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT |_MM_FROUND_NO_EXC);
+    __m512 t = _mm512_fnmadd_ps(fx, c1, x);
+    t = _mm512_fnmadd_ps(fx, c2, t);
+    __m512 z = _mm512_mul_ps(t, t);
+    __m512 y = _mm512_fmadd_ps(p0, t, p1);
+    y = _mm512_fmadd_ps(y, t, p2);
+    y = _mm512_fmadd_ps(y, t, p3);
+    y = _mm512_fmadd_ps(y, t, p4);
+    y = _mm512_fmadd_ps(y, t, p5);
+    y = _mm512_add_ps(_mm512_fmadd_ps(y, z, t), _mm512_set1_ps(1.0f));
+
+    /* Build 2^n */
+    __m512i imm0 = _mm512_cvtps_epi32(fx);
+    imm0 = _mm512_add_epi32(imm0, _mm512_set1_epi32(127));
+    imm0 = _mm512_slli_epi32(imm0, 23);
+    __m512 pow2n = _mm512_castsi512_ps(imm0);
+
+    return _mm512_mul_ps(y, pow2n);
+}
+
 /* Cached runtime check: -1 = unchecked, 0 = unavailable, 1 = available */
 static int avx512bf16_detected = -1;
 static int avx512bf16_check(void) {
@@ -51,7 +94,11 @@ static int avx512bf16_check(void) {
 
 void vox_add_inplace(float *a, const float *b, int n) {
     int i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+    for (; i <= n - 16; i += 16) {
+        _mm512_storeu_ps(a + i, _mm512_add_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+    }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(a + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
     }
@@ -61,7 +108,11 @@ void vox_add_inplace(float *a, const float *b, int n) {
 
 void vox_mul_inplace(float *a, const float *b, int n) {
     int i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+    for (; i <= n - 16; i += 16) {
+        _mm512_storeu_ps(a + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+    }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
     }
@@ -71,7 +122,12 @@ void vox_mul_inplace(float *a, const float *b, int n) {
 
 void vox_axpy(float *a, float scale, const float *b, int n) {
     int i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+    __m512 s512 = _mm512_set1_ps(scale);
+    for (; i <= n - 16; i += 16) {
+        _mm512_storeu_ps(a + i, _mm512_fmadd_ps(s512, _mm512_loadu_ps(b + i), _mm512_loadu_ps(a + i)));
+    }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     __m256 s = _mm256_set1_ps(scale);
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(a + i, _mm256_fmadd_ps(s, _mm256_loadu_ps(b + i), _mm256_loadu_ps(a + i)));
@@ -82,7 +138,12 @@ void vox_axpy(float *a, float scale, const float *b, int n) {
 
 void vox_scale(float *x, float s, int n) {
     int i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+    __m512 s_vec512 = _mm512_set1_ps(s);
+    for (; i <= n - 16; i += 16) {
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(_mm512_loadu_ps(x + i), s_vec512));
+    }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     __m256 s_vec = _mm256_set1_ps(s);
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), s_vec));
@@ -331,6 +392,10 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         avx512bf16_check();
         matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
         return;
+    } else if (seq_len == 1) {
+        avx512bf16_check();
+        matvec_avx512bf16(y, x, W_bf16, out_dim, in_dim);
+        return;
     }
 #endif
     if (seq_len == 1) {
@@ -371,6 +436,13 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
             }
         }
         return;
+    } else if (seq_len == 1) {
+        avx512bf16_check();
+        matvec_avx512bf16(y, x, W_bf16, out_dim, in_dim);
+        if (b != NULL) {
+            for (int o = 0; o < out_dim; o++) y[o] += b[o];
+        }
+        return;
     }
 #endif
     if (seq_len == 1) {
@@ -401,6 +473,10 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
     if (M > 1) {
         avx512bf16_check();
         matmul_avx512bf16_tiled(C, A, B_bf16, M, N, K);
+        return;
+    } else if (M == 1) {
+        avx512bf16_check();
+        matvec_avx512bf16(C, A, B_bf16, N, K);
         return;
     }
 #endif
@@ -509,7 +585,14 @@ void vox_rms_norm(float *out, const float *x, const float *weight,
         float sum_sq = 0.0f;
         int i = 0;
 
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+        __m512 v_sum_sq512 = _mm512_setzero_ps();
+        for (; i <= hidden - 16; i += 16) {
+            __m512 v_x = _mm512_loadu_ps(x_row + i);
+            v_sum_sq512 = _mm512_fmadd_ps(v_x, v_x, v_sum_sq512);
+        }
+        sum_sq = _mm512_reduce_add_ps(v_sum_sq512);
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
         __m256 v_sum_sq = _mm256_setzero_ps();
         for (; i <= hidden - 8; i += 8) {
             __m256 v_x = _mm256_loadu_ps(x_row + i);
@@ -527,7 +610,14 @@ void vox_rms_norm(float *out, const float *x, const float *weight,
         float rms_inv = 1.0f / rms;
 
         i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+        __m512 v_rms_inv512 = _mm512_set1_ps(rms_inv);
+        for (; i <= hidden - 16; i += 16) {
+            __m512 v_x = _mm512_loadu_ps(x_row + i);
+            __m512 v_w = _mm512_loadu_ps(weight + i);
+            _mm512_storeu_ps(out_row + i, _mm512_mul_ps(_mm512_mul_ps(v_x, v_rms_inv512), v_w));
+        }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
         __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
         for (; i <= hidden - 8; i += 8) {
             __m256 v_x = _mm256_loadu_ps(x_row + i);
@@ -583,7 +673,15 @@ static inline __m256 exp256_ps(__m256 x) {
 
 void vox_silu(float *x, int n) {
     int i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+    __m512 one512 = _mm512_set1_ps(1.0f);
+    for (; i <= n - 16; i += 16) {
+        __m512 vx = _mm512_loadu_ps(x + i);
+        __m512 vexp = exp512_ps(_mm512_sub_ps(_mm512_setzero_ps(), vx));
+        __m512 res = _mm512_div_ps(vx, _mm512_add_ps(one512, vexp));
+        _mm512_storeu_ps(x + i, res);
+    }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     __m256 one = _mm256_set1_ps(1.0f);
     for (; i <= n - 8; i += 8) {
         __m256 vx = _mm256_loadu_ps(x + i);
@@ -600,7 +698,23 @@ void vox_silu(float *x, int n) {
 
 void vox_gelu(float *x, int n) {
     int i = 0;
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(USE_AVX512BF16)
+    __m512 half512 = _mm512_set1_ps(0.5f);
+    __m512 one512 = _mm512_set1_ps(1.0f);
+    __m512 k0_512 = _mm512_set1_ps(0.7978845608f);
+    __m512 k1_512 = _mm512_set1_ps(0.044715f);
+    __m512 two512 = _mm512_set1_ps(2.0f);
+
+    for (; i <= n - 16; i += 16) {
+        __m512 vx = _mm512_loadu_ps(x + i);
+        __m512 x3 = _mm512_mul_ps(_mm512_mul_ps(vx, vx), vx);
+        __m512 inner = _mm512_mul_ps(k0_512, _mm512_fmadd_ps(k1_512, x3, vx));
+        __m512 e2x = exp512_ps(_mm512_mul_ps(two512, inner));
+        __m512 vtanh = _mm512_div_ps(_mm512_sub_ps(e2x, one512), _mm512_add_ps(e2x, one512));
+        __m512 res = _mm512_mul_ps(half512, _mm512_mul_ps(vx, _mm512_add_ps(one512, vtanh)));
+        _mm512_storeu_ps(x + i, res);
+    }
+#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     /* GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
     __m256 half = _mm256_set1_ps(0.5f);
     __m256 one = _mm256_set1_ps(1.0f);

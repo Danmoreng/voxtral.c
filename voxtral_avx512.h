@@ -93,6 +93,61 @@ static inline __m256i fp32x16_to_bf16(__m512 v) {
  * Core Matmul Kernel: C[M×N] += A[M×K](fp32) × B^T[N×K](bf16)
  * ======================================================================== */
 
+/*
+ * matvec_avx512bf16 - Optimized for single-row (M=1) matrix-vector multiply.
+ * C[N] += A[K](fp32) * B^T[N*K](bf16)
+ */
+static void matvec_avx512bf16(
+    float *restrict C,
+    const float *restrict A,
+    const uint16_t *restrict B,
+    int N, int K)
+{
+    int K_padded = (K + 31) & ~31;
+    
+    /* Convert A to BF16 once */
+    uint16_t a_bf16_stack[((16384 + 31) & ~31)];
+    uint16_t *a_bf16 = a_bf16_stack;
+#ifdef _MSC_VER
+    if (K_padded > (int)sizeof(a_bf16_stack) / (int)sizeof(uint16_t)) {
+        a_bf16 = (uint16_t *)_malloca(K_padded * sizeof(uint16_t));
+    }
+#else
+    if (K_padded > (int)sizeof(a_bf16_stack) / (int)sizeof(uint16_t)) {
+        a_bf16 = (uint16_t *)__builtin_alloca(K_padded * sizeof(uint16_t));
+    }
+#endif
+
+    int k = 0;
+    for (; k + 15 < K; k += 16) {
+        __m512 av = _mm512_loadu_ps(A + k);
+        __m256i abf = fp32x16_to_bf16(av);
+        _mm256_storeu_si256((__m256i *)(a_bf16 + k), abf);
+    }
+    for (; k < K; k++) {
+        uint32_t bits;
+        memcpy(&bits, &A[k], sizeof(bits));
+        a_bf16[k] = (uint16_t)(bits >> 16);
+    }
+    for (k = K; k < K_padded; k++) a_bf16[k] = 0;
+
+    int j;
+    #pragma omp parallel for schedule(static) private(j)
+    for (j = 0; j < N; j++) {
+        const uint16_t *b_row = B + (size_t)j * K;
+        __m512 sum = _mm512_setzero_ps();
+
+        for (int kk = 0; kk < K_padded; kk += 32) {
+            sum = _mm512_dpbf16_ps(sum, voxtral_loadu_pbh(a_bf16 + kk), voxtral_loadu_pbh(b_row + kk));
+        }
+        C[j] = _mm512_reduce_add_ps(sum);
+    }
+
+#ifdef _MSC_VER
+    if (a_bf16 != a_bf16_stack) _freea(a_bf16);
+#endif
+}
+
 static void matmul_avx512bf16_tiled(
     float *restrict C,
     const float *restrict A,
