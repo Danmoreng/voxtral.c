@@ -13,6 +13,7 @@
 
 /* Forward declarations */
 typedef struct vox_cuda_ctx vox_cuda_ctx_t;
+typedef struct vox_tokenizer vox_tokenizer_t;
 typedef struct vox_ctx vox_ctx_t;
 
 typedef enum {
@@ -184,6 +185,7 @@ struct vox_ctx {
     vox_encoder_t encoder;
     vox_adapter_t adapter;
     vox_decoder_t decoder;
+    vox_tokenizer_t *tokenizer;
 
     vox_backend_t backend;
 

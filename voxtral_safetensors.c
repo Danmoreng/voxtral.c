@@ -530,10 +530,13 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
         case DTYPE_F16: {
             uint16_t *src_host = (uint16_t *)vox_cpu_malloc(n * 2);
 #ifdef USE_CUDA
-            vox_cuda_copy_to_host(src_host, data, n * 2);
-#else
-            memcpy(src_host, data, n * 2);
+            if (g_selected_backend == VOX_BACKEND_CUDA) {
+                vox_cuda_copy_to_host(src_host, data, n * 2);
+            } else
 #endif
+            {
+                memcpy(src_host, data, n * 2);
+            }
             float *out_host = (float *)vox_cpu_malloc(n * 4);
             for (int64_t i = 0; i < n; i++) {
                 out_host[i] = f16_to_f32(src_host[i]);
@@ -547,10 +550,13 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
         case DTYPE_BF16: {
             uint16_t *src_host = (uint16_t *)vox_cpu_malloc(n * 2);
 #ifdef USE_CUDA
-            vox_cuda_copy_to_host(src_host, data, n * 2);
-#else
-            memcpy(src_host, data, n * 2);
+            if (g_selected_backend == VOX_BACKEND_CUDA) {
+                vox_cuda_copy_to_host(src_host, data, n * 2);
+            } else
 #endif
+            {
+                memcpy(src_host, data, n * 2);
+            }
             float *out_host = (float *)vox_cpu_malloc(n * 4);
             for (int64_t i = 0; i < n; i++) {
                 out_host[i] = bf16_to_f32(src_host[i]);
@@ -564,6 +570,73 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
         default:
             fprintf(stderr, "safetensors_get_f32: unsupported dtype\n");
             vox_mem_free(out);
+            return NULL;
+    }
+
+    return out;
+}
+
+float *safetensors_get_f32_cpu(const safetensors_file_t *sf, const safetensor_t *t) {
+    int64_t n = safetensor_numel(t);
+    if (n <= 0) return NULL;
+
+    size_t elem_size = (t->dtype == DTYPE_F32) ? 4 : 2;
+    if ((size_t)n * elem_size > t->data_size) return NULL;
+
+    float *out = (float *)vox_cpu_malloc(n * sizeof(float));
+    if (!out) return NULL;
+
+    const void *data = safetensors_data(sf, t);
+
+    switch (t->dtype) {
+        case DTYPE_F32:
+#ifdef USE_CUDA
+            if (g_selected_backend == VOX_BACKEND_CUDA) {
+                vox_cuda_copy_to_host(out, data, n * sizeof(float));
+            } else
+#endif
+            {
+                memcpy(out, data, n * sizeof(float));
+            }
+            break;
+
+        case DTYPE_F16: {
+            uint16_t *src_host = (uint16_t *)vox_cpu_malloc(n * 2);
+#ifdef USE_CUDA
+            if (g_selected_backend == VOX_BACKEND_CUDA) {
+                vox_cuda_copy_to_host(src_host, data, n * 2);
+            } else
+#endif
+            {
+                memcpy(src_host, data, n * 2);
+            }
+            for (int64_t i = 0; i < n; i++) {
+                out[i] = f16_to_f32(src_host[i]);
+            }
+            vox_cpu_free(src_host);
+            break;
+        }
+
+        case DTYPE_BF16: {
+            uint16_t *src_host = (uint16_t *)vox_cpu_malloc(n * 2);
+#ifdef USE_CUDA
+            if (g_selected_backend == VOX_BACKEND_CUDA) {
+                vox_cuda_copy_to_host(src_host, data, n * 2);
+            } else
+#endif
+            {
+                memcpy(src_host, data, n * 2);
+            }
+            for (int64_t i = 0; i < n; i++) {
+                out[i] = bf16_to_f32(src_host[i]);
+            }
+            vox_cpu_free(src_host);
+            break;
+        }
+
+        default:
+            fprintf(stderr, "safetensors_get_f32_cpu: unsupported dtype\n");
+            vox_cpu_free(out);
             return NULL;
     }
 

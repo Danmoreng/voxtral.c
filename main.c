@@ -117,6 +117,7 @@ static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples)
 }
 
 int main(int argc, char **argv) {
+    printf("DEBUG: Starting main...\n");
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
 #endif
@@ -195,6 +196,10 @@ int main(int argc, char **argv) {
 #ifdef USE_METAL
     vox_metal_init();
 #endif
+
+    if (verbosity >= 1) {
+        printf("Selected backend: %s\n", backend == VOX_BACKEND_CUDA ? "CUDA" : (backend == VOX_BACKEND_METAL ? "Metal" : "CPU"));
+    }
 
     /* Load model */
     vox_ctx_t *ctx = vox_load(model_dir, backend);

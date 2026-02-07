@@ -93,13 +93,15 @@ static int avx512bf16_check(void) {
 /* Minimum matrix size to use GPU */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
+extern vox_backend_t g_selected_backend;
+
 /* ========================================================================
  * Basic Element-wise Operations
  * ======================================================================== */
 
 void vox_add_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_add_inplace(ctx, a, b, n);
         return;
     }
@@ -119,7 +121,7 @@ void vox_add_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
 
 void vox_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_mul_inplace(ctx, a, b, n);
         return;
     }
@@ -139,7 +141,7 @@ void vox_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
 
 void vox_axpy(vox_cuda_ctx_t *ctx, float *a, float scale, const float *b, int n) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_axpy(ctx, a, scale, b, n);
         return;
     }
@@ -192,7 +194,7 @@ void vox_copy(float *dst, const float *src, int n) {
 
 void vox_matmul(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         /* cuBLAS handles large matrices efficiently */
         vox_cuda_sgemm(ctx, M, N, K, A, B, C);
         return;
@@ -238,7 +240,7 @@ void vox_matmul(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, i
 
 void vox_matmul_t(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_sgemm_t(ctx, M, N, K, A, B, C);
         return;
     }
@@ -286,7 +288,7 @@ void vox_matmul_t(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B,
 void vox_linear(vox_cuda_ctx_t *ctx, float *y, const float *x, const float *W, const float *b,
                 int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_matmul_t(ctx, y, x, W, seq_len, in_dim, out_dim);
         if (b != NULL) {
             vox_cuda_bias_add(ctx, y, b, seq_len, out_dim);
@@ -429,7 +431,7 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
 void vox_linear_nobias_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_matmul_bf16(ctx, seq_len, out_dim, in_dim, x, W_bf16, y, 1);
         return;
     }
@@ -465,7 +467,7 @@ void vox_linear_nobias_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const
 void vox_linear_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16_t *W_bf16,
                      const float *b, int seq_len, int in_dim, int out_dim) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_matmul_bf16(ctx, seq_len, out_dim, in_dim, x, W_bf16, y, 1);
         if (b != NULL) {
             vox_cuda_bias_add(ctx, y, b, seq_len, out_dim);
@@ -521,7 +523,7 @@ void vox_linear_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16
 void vox_matmul_t_bf16(vox_cuda_ctx_t *ctx, float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_matmul_bf16(ctx, M, N, K, A, B_bf16, C, 1);
         return;
     }
@@ -598,7 +600,7 @@ void vox_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const f
     if (out_length <= 0) return;
 
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_causal_conv1d(ctx, out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
         return;
     }
@@ -654,7 +656,7 @@ void vox_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const f
 void vox_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const float *weight,
                   int seq_len, int hidden, float eps) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_rms_norm(ctx, out, x, weight, seq_len, hidden, eps);
         return;
     }
@@ -754,7 +756,7 @@ static inline __m256 exp256_ps(__m256 x) {
 
 void vox_silu(vox_cuda_ctx_t *ctx, float *x, int n) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_silu(ctx, x, n);
         return;
     }
@@ -785,7 +787,7 @@ void vox_silu(vox_cuda_ctx_t *ctx, float *x, int n) {
 
 void vox_gelu(vox_cuda_ctx_t *ctx, float *x, int n) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_gelu(ctx, x, n);
         return;
     }
@@ -866,7 +868,7 @@ void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const
                           int head_dim, float scale, int window_size,
                           int q_offset) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_causal_attention(ctx, out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
         return;
     }
@@ -947,7 +949,7 @@ void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const
 
 void vox_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, int seq, int dim, float theta) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_compute_rope_freqs(ctx, freqs, pos, seq, dim, theta);
         return;
     }
@@ -967,7 +969,7 @@ void vox_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, i
 
 void vox_apply_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, int heads, int head_dim) {
 #ifdef USE_CUDA
-    if (vox_cuda_available()) {
+    if (g_selected_backend == VOX_BACKEND_CUDA) {
         vox_cuda_rope(ctx, x, freqs, seq, heads, head_dim);
         return;
     }

@@ -40,6 +40,15 @@ static float *load_f32(safetensors_file_t *sf, const char *name) {
     return safetensors_get_f32(sf, t);
 }
 
+static float *load_f32_cpu(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "decoder: weight not found: %s\n", name);
+        return NULL;
+    }
+    return safetensors_get_f32_cpu(sf, t);
+}
+
 static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) {
@@ -63,9 +72,9 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
 
         /* Ada RMS norm MLP (small, always f32) */
         snprintf(name, sizeof(name), "layers.%d.ada_rms_norm_t_cond.0.weight", i);
-        l->ada_norm_down = load_f32(sf, name);
+        l->ada_norm_down = load_f32_cpu(sf, name);
         snprintf(name, sizeof(name), "layers.%d.ada_rms_norm_t_cond.2.weight", i);
-        l->ada_norm_up = load_f32(sf, name);
+        l->ada_norm_up = load_f32_cpu(sf, name);
 
         /* Attention (large matmul weights: bf16 mmap direct) */
         snprintf(name, sizeof(name), "layers.%d.attention.wq.weight", i);
@@ -79,7 +88,7 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
 
         /* Norms (small, always f32) */
         snprintf(name, sizeof(name), "layers.%d.attention_norm.weight", i);
-        l->attention_norm = load_f32(sf, name);
+        l->attention_norm = load_f32_cpu(sf, name);
 
         /* FFN (large matmul weights: bf16 mmap direct) */
         snprintf(name, sizeof(name), "layers.%d.feed_forward.w1.weight", i);
@@ -91,7 +100,7 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
 
         /* Norms (small, always f32) */
         snprintf(name, sizeof(name), "layers.%d.ffn_norm.weight", i);
-        l->ffn_norm = load_f32(sf, name);
+        l->ffn_norm = load_f32_cpu(sf, name);
 
         if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
             !l->wv_weight_bf16 || !l->wo_weight_bf16) {
@@ -104,7 +113,7 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
     }
 
     /* Final norm */
-    dec->norm = load_f32(sf, "norm.weight");
+    dec->norm = load_f32_cpu(sf, "norm.weight");
     if (!dec->norm) return -1;
 
     return 0;
@@ -275,9 +284,12 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
     int *pos_host = (int *)vox_cpu_malloc(seq_len * sizeof(int));
     for (int i = 0; i < seq_len; i++) pos_host[i] = logical_start + i;
+#ifdef USE_CUDA
     if (ctx->backend == VOX_BACKEND_CUDA) {
         vox_cuda_copy_to_device(positions, pos_host, seq_len * sizeof(int));
-    } else {
+    } else
+#endif
+    {
         memcpy(positions, pos_host, seq_len * sizeof(int));
     }
     vox_cpu_free(pos_host);

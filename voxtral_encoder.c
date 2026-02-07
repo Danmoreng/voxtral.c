@@ -41,6 +41,15 @@ static float *load_f32(safetensors_file_t *sf, const char *name) {
     return safetensors_get_f32(sf, t);
 }
 
+static float *load_f32_cpu(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "encoder: weight not found: %s\n", name);
+        return NULL;
+    }
+    return safetensors_get_f32_cpu(sf, t);
+}
+
 static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) {
@@ -57,11 +66,11 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
     snprintf(name, sizeof(name), "%s.conv_layers.0.conv.weight", ENC_PREFIX);
     enc->conv0_weight = load_f32(sf, name);
     snprintf(name, sizeof(name), "%s.conv_layers.0.conv.bias", ENC_PREFIX);
-    enc->conv0_bias = load_f32(sf, name);
+    enc->conv0_bias = load_f32_cpu(sf, name);
     snprintf(name, sizeof(name), "%s.conv_layers.1.conv.weight", ENC_PREFIX);
     enc->conv1_weight = load_f32(sf, name);
     snprintf(name, sizeof(name), "%s.conv_layers.1.conv.bias", ENC_PREFIX);
-    enc->conv1_bias = load_f32(sf, name);
+    enc->conv1_bias = load_f32_cpu(sf, name);
 
     if (!enc->conv0_weight || !enc->conv1_weight) return -1;
 
@@ -88,18 +97,18 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
 
         /* Small weights: biases and norms (always f32) */
         snprintf(name, sizeof(name), "%s.%d.attention.wq.bias", lp, i);
-        l->wq_bias = load_f32(sf, name);
+        l->wq_bias = load_f32_cpu(sf, name);
         /* wk has NO bias */
         snprintf(name, sizeof(name), "%s.%d.attention.wv.bias", lp, i);
-        l->wv_bias = load_f32(sf, name);
+        l->wv_bias = load_f32_cpu(sf, name);
         snprintf(name, sizeof(name), "%s.%d.attention.wo.bias", lp, i);
-        l->wo_bias = load_f32(sf, name);
+        l->wo_bias = load_f32_cpu(sf, name);
         snprintf(name, sizeof(name), "%s.%d.attention_norm.weight", lp, i);
-        l->attention_norm = load_f32(sf, name);
+        l->attention_norm = load_f32_cpu(sf, name);
         snprintf(name, sizeof(name), "%s.%d.feed_forward.w2.bias", lp, i);
-        l->w2_bias = load_f32(sf, name);
+        l->w2_bias = load_f32_cpu(sf, name);
         snprintf(name, sizeof(name), "%s.%d.ffn_norm.weight", lp, i);
-        l->ffn_norm = load_f32(sf, name);
+        l->ffn_norm = load_f32_cpu(sf, name);
 
         if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
             !l->wv_weight_bf16 || !l->wo_weight_bf16) {
@@ -113,7 +122,7 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
 
     /* Final norm */
     snprintf(name, sizeof(name), "%s.transformer.norm.weight", ENC_PREFIX);
-    enc->norm = load_f32(sf, name);
+    enc->norm = load_f32_cpu(sf, name);
 
     if (!enc->norm) return -1;
     return 0;
@@ -219,9 +228,12 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
     int *pos_host = (int *)vox_cpu_malloc(seq_len * sizeof(int));
     for (int i = 0; i < seq_len; i++) pos_host[i] = i;
+#ifdef USE_CUDA
     if (ctx->backend == VOX_BACKEND_CUDA) {
         vox_cuda_copy_to_device(positions, pos_host, seq_len * sizeof(int));
-    } else {
+    } else
+#endif
+    {
         memcpy(positions, pos_host, seq_len * sizeof(int));
     }
     vox_cpu_free(pos_host);
@@ -527,9 +539,12 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     int *positions = ctx->enc_inc_positions;
     int *pos_host = (int *)vox_cpu_malloc(new_len * sizeof(int));
     for (int i = 0; i < new_len; i++) pos_host[i] = logical_start + i;
+#ifdef USE_CUDA
     if (ctx->backend == VOX_BACKEND_CUDA) {
         vox_cuda_copy_to_device(positions, pos_host, new_len * sizeof(int));
-    } else {
+    } else
+#endif
+    {
         memcpy(positions, pos_host, new_len * sizeof(int));
     }
     vox_cpu_free(pos_host);
