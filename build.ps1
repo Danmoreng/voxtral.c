@@ -82,7 +82,7 @@ if (-not $CC) {
 Write-Host "Using compiler: $CC"
 
 if ($CC -eq "gcc") {
-    $CFLAGS = "-Wall", "-Wextra", "-O3", "-march=native", "-ffast-math"
+    $CFLAGS = "-Wall", "-Wextra", "-O3", "-march=native", "-ffast-math", "-mavx2", "-mfma"
     $LDFLAGS = "-lm"
     if ($Debug) {
         $CFLAGS = "-Wall", "-Wextra", "-g", "-O0", "-DDEBUG"
@@ -94,10 +94,10 @@ if ($CC -eq "gcc") {
     $cmd = "$CC $CFLAGS -o $TARGET $SRCS $LDFLAGS"
 } else {
     # MSVC (cl.exe)
-    # /O2: Optimization, /W3: Warning level, /MT: Static CRT, /D_CRT_SECURE_NO_WARNINGS, /openmp: Enable OpenMP
-    $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp"
+    # /O2: Optimization, /W3: Warning level, /MT: Static CRT, /D_CRT_SECURE_NO_WARNINGS, /openmp: Enable OpenMP, /arch:AVX2: Enable AVX2
+    $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
     if ($Debug) {
-        $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp"
+        $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
     }
     if ($Blas) {
         $CFLAGS += "/DUSE_BLAS", "/DUSE_OPENBLAS"

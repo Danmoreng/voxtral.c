@@ -20,6 +20,10 @@
 #endif
 #endif
 
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#include <immintrin.h>
+#endif
+
 /* Minimum matrix size to use GPU */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
@@ -165,7 +169,29 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
         float sum = bias ? bias[o] : 0.0f;
         int k = 0;
 
-#ifdef __ARM_NEON
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+        __m256 acc = _mm256_setzero_ps();
+        for (; k + 8 <= in_dim; k += 8) {
+            /* Load 8 bf16 weights (128 bits) */
+            __m128i bf = _mm_loadu_si128((const __m128i*)(w_row + k));
+            /* Expand to 8x32-bit ints */
+            __m256i w_int = _mm256_cvtepu16_epi32(bf);
+            /* Shift left by 16 to get f32 bit pattern */
+            w_int = _mm256_slli_epi32(w_int, 16);
+            /* Cast to float */
+            __m256 w_f32 = _mm256_castsi256_ps(w_int);
+            
+            /* Load 8 input floats */
+            __m256 x_vec = _mm256_loadu_ps(x + k);
+            
+            /* Fused multiply-add */
+            acc = _mm256_fmadd_ps(w_f32, x_vec, acc);
+        }
+        /* Horizontal sum */
+        float temp[8];
+        _mm256_storeu_ps(temp, acc);
+        for(int i=0; i<8; i++) sum += temp[i];
+#elif defined(__ARM_NEON)
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
 
