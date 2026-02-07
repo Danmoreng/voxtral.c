@@ -84,6 +84,28 @@ CUDA (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Encoder: `760 mel -> 95 tokens (646 ms)`
 - Decoder: `17 text tokens (57 steps) in 2159 ms (prefill 1435 ms + 12.9 ms/step)`
 
+### Full CUDA Streaming Pipeline (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_PIPELINE_FULL=1
+```
+
+This keeps streaming adapter embeddings on-device and lets CUDA build the per-step decoder input embedding directly from the device-side adapter buffer:
+- Avoids a large adapter `DtoH` copy for every encoder chunk (streaming mode).
+- Avoids uploading a new step embedding (`HtoD`) every generated token.
+
+Notes:
+- Experimental and currently **not thread-safe** (uses a global device-side adapter buffer).
+- If it fails mid-run, we currently fail-fast rather than attempting a CPU fallback.
+- Prompt prefill still copies only the first prompt window from device to host to reuse the existing prefill path.
+- In pipeline mode, GPU conv stem is attempted by default unless disabled (`VOX_DISABLE_CUDA_CONV_STEM=1`).
+
+Related env vars:
+- `VOX_DISABLE_CUDA_PIPELINE_FULL=1` disables the pipeline.
+- `VOX_CUDA_ADAPTER_CAP_TOKENS=<int>` sets the initial adapter buffer capacity (default: 8192).
+
 ### `samples/I_have_a_dream.ogg` (180s)
 
 Convert once:
