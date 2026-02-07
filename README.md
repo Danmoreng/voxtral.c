@@ -19,6 +19,7 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
+# or: make avx512  # AVX-512 BF16 direct (no OpenBLAS needed)
 # or: make cpu     # Pure C, no dependencies (slower)
 
 # Download the model (~8.9GB)
@@ -33,6 +34,9 @@ make mps       # Apple Silicon (fastest)
 # Build (requires Visual Studio Build Tools or MinGW-w64)
 # Build script will try to find cl.exe or gcc.exe
 .\build.ps1
+
+# Build with AVX-512 BF16 acceleration (fastest on modern CPUs)
+.\build.ps1 -Avx512
 
 # Download the model (~8.9GB)
 .\download_model.ps1
@@ -56,7 +60,8 @@ This requires just PyTorch and a few standard libraries.
 
 ## Features
 
-- **Zero dependencies**: Pure C implementation, works standalone for MPS. BLAS required for other targets (OpenBLAS on Linux).
+- **Zero dependencies**: Pure C implementation, works standalone for MPS or CPU. BLAS optional.
+- **AVX-512 BF16 acceleration**: Direct hardware support for BF16 math on AMD Zen 4+ and Intel Sapphire Rapids+ (Windows/Linux).
 - **Metal GPU acceleration**: Automatic on Apple Silicon Macs with fused GPU operations and batched attention.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word.
 - **Streaming C API**: Feed audio incrementally, get token strings back as they become available.
@@ -233,22 +238,16 @@ Choose a backend when building:
 make            # Show available backends
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
-<<<<<<< HEAD
+make avx512     # AVX-512 BF16 direct (Windows/Linux, no OpenBLAS needed)
 make cpu        # Pure C, no dependencies (slower)
-=======
-make avx512     # AVX-512 BF16 direct (Linux, no OpenBLAS needed)
->>>>>>> avx512-integration
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
 - Linux with OpenBLAS: `make blas`
-<<<<<<< HEAD
 - Windows: `.\build.ps1`
-=======
-- Linux with AVX-512 BF16: `make avx512` (For AMD Zen 4+ and Intel Sapphire Rapids+ CPUs. A runtime check will print an error if the CPU lacks support.)
->>>>>>> avx512-integration
+- Windows/Linux with AVX-512 BF16: `make avx512` or `.\build.ps1 -Avx512` (For AMD Zen 4+ and Intel Sapphire Rapids+ CPUs. A runtime check will print an error if the CPU lacks support.)
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -292,9 +291,14 @@ Benchmarks on **Apple M3 Max** (40-core GPU, 128GB RAM, 400 GB/s bandwidth):
 | MPS | 284 ms | 252 ms | 23.5 ms/step (short) |
 | BLAS | ~8s | ~1.2s | 335 ms/step |
 
-The MPS backend runs the entire decoder in a single Metal command buffer per token, with custom GPU kernels for attention, RoPE, and KV cache management. All weights are pre-converted to f16 on GPU at load time. The BLAS backend uses Accelerate's multi-threaded sgemm with on-the-fly BF16→F32 conversion.
+Benchmarks on **AMD Ryzen 9800X3D** (Zen 5, 8 cores):
 
-Decoder speed depends on sequence length: attention scans the full KV cache each step, so longer transcriptions are slower per token. For a 60-second clip (~760 steps), the average is ~31.6 ms/step. For short clips (~15 steps) it's ~23.5 ms/step. Either way, the decoder generates one token per ~80ms of audio, so even at 31.6 ms/step transcription runs ~2.5x faster than real-time.
+| Backend | Encoder (11s audio) | Prefill | Decoder |
+|---------|---------------------|---------|---------|
+| OpenBLAS | ~10.0s | ~2.0s | 198.8 ms/step |
+| AVX-512 | ~5.5s | ~1.1s | 125.6 ms/step |
+
+Decoder speed depends on sequence length: attention scans the full KV cache each step, so longer transcriptions are slower per token.
 
 Longer audio scales linearly with the encoder (O(n) with sliding window attention) and the decoder (one token per 80ms of audio).
 
