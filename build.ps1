@@ -2,7 +2,8 @@
 param(
     [switch]$Clean,
     [switch]$Blas,
-    [switch]$Debug
+    [switch]$Debug,
+    [switch]$Avx512
 )
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,9 @@ if ($CC -eq "gcc") {
     if ($Debug) {
         $CFLAGS = "-Wall", "-Wextra", "-g", "-O0", "-DDEBUG"
     }
+    if ($Avx512) {
+        $CFLAGS += "-mavx512f", "-mavx512bf16", "-DUSE_AVX512BF16"
+    }
     if ($Blas) {
         $CFLAGS += "-DUSE_BLAS", "-DUSE_OPENBLAS"
         $LDFLAGS += "-lopenblas"
@@ -98,6 +102,10 @@ if ($CC -eq "gcc") {
     $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
     if ($Debug) {
         $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
+    }
+    if ($Avx512) {
+        # Note: /arch:AVX512 is available in VS 2017 15.3+
+        $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX512", "/DUSE_AVX512BF16"
     }
     if ($Blas) {
         $CFLAGS += "/DUSE_BLAS", "/DUSE_OPENBLAS"

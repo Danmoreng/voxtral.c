@@ -41,7 +41,6 @@ static int avx512bf16_check(void) {
     return 1;
 }
 #endif
-#endif
 
 /* Minimum matrix size to use GPU */
 #define MIN_GPU_ELEMENTS (512 * 512)
