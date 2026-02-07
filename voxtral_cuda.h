@@ -44,6 +44,9 @@ void vox_cuda_kv_cache_update(vox_cuda_ctx_t *ctx, float *cache_k, float *cache_
 void vox_cuda_copy_to_device(void *dst, const void *src, size_t size);
 void vox_cuda_copy_to_host(void *dst, const void *src, size_t size);
 
+/* Argmax */
+void vox_cuda_argmax(vox_cuda_ctx_t *ctx, int *out_gpu, const float *logits_gpu, int n);
+
 /* Math kernels */
 void vox_cuda_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const float *weight, int n, int hidden, float eps);
 void vox_cuda_rms_norm_residual(vox_cuda_ctx_t *ctx, float *out, float *x, const float *residual, const float *weight, int n, int hidden, float eps);
@@ -57,6 +60,7 @@ void vox_cuda_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n);
 void vox_cuda_axpy(vox_cuda_ctx_t *ctx, float *a, float scale, const float *b, int n);
 void vox_cuda_bias_add(vox_cuda_ctx_t *ctx, float *y, const float *b, int seq_len, int out_dim);
 void vox_cuda_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, int heads, int head_dim);
+void vox_cuda_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, int seq, int dim, float theta);
 void vox_cuda_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *weight, const float *bias,
                             int channels_in, int channels_out, int length, int out_length,
                             int kernel_size, int stride);

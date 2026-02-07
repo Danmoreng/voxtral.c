@@ -176,8 +176,8 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
 
     size_t copy = (size_t)ctx->kv_cache_len * kv_dim * sizeof(float);
     for (int l = 0; l < VOX_DEC_LAYERS; l++) {
-        memcpy(new_k + l * new_stride, ctx->kv_cache_k + l * old_stride, copy);
-        memcpy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
+        vox_mem_copy(new_k + l * new_stride, ctx->kv_cache_k + l * old_stride, copy);
+        vox_mem_copy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
     }
 
 #ifdef USE_METAL
@@ -228,8 +228,8 @@ static void kv_cache_compact(vox_ctx_t *ctx) {
         float *k_src  = kv_cache_k_at(ctx, l, discard);
         float *v_base = kv_cache_v_at(ctx, l, 0);
         float *v_src  = kv_cache_v_at(ctx, l, discard);
-        memmove(k_base, k_src, keep_bytes);
-        memmove(v_base, v_src, keep_bytes);
+        vox_mem_copy(k_base, k_src, keep_bytes);
+        vox_mem_copy(v_base, v_src, keep_bytes);
     }
 
     ctx->kv_pos_offset += discard;
@@ -273,9 +273,13 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     int start_pos = ctx->kv_cache_len;
     int logical_start = ctx->kv_pos_offset + start_pos;
     int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
-    for (int i = 0; i < seq_len; i++) positions[i] = logical_start + i;
+    int *pos_host = (int *)vox_cpu_malloc(seq_len * sizeof(int));
+    for (int i = 0; i < seq_len; i++) pos_host[i] = logical_start + i;
+    vox_mem_copy(positions, pos_host, seq_len * sizeof(int));
+    vox_cpu_free(pos_host);
+
     float *rope_freqs = (float *)vox_mem_malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
-    vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(ctx->cuda_ctx, rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
     /* GPU monolithic prefill: all 26 layers in one command buffer */
 #ifdef USE_METAL
@@ -316,9 +320,9 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
         /* Store K, V in cache */
         for (int s = 0; s < seq_len; s++) {
-            memcpy(kv_cache_k_at(ctx, layer, start_pos + s),
+            vox_mem_copy(kv_cache_k_at(ctx, layer, start_pos + s),
                    k + s * kv_dim, kv_dim * sizeof(float));
-            memcpy(kv_cache_v_at(ctx, layer, start_pos + s),
+            vox_mem_copy(kv_cache_v_at(ctx, layer, start_pos + s),
                    v + s * kv_dim, kv_dim * sizeof(float));
         }
 
@@ -406,9 +410,10 @@ static void ensure_dec_buffers(vox_ctx_t *ctx) {
 
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        ctx->cuda_d_pos = (int *)vox_cuda_malloc(sizeof(int));
-        ctx->cuda_d_total_seq = (int *)vox_cuda_malloc(sizeof(int));
-        ctx->cuda_d_rope = (float *)vox_cuda_malloc((head_dim / 2) * 2 * sizeof(float));
+        ctx->cuda_d_pos = (int *)vox_cuda_malloc(ctx->cuda_ctx, sizeof(int));
+        ctx->cuda_d_total_seq = (int *)vox_cuda_malloc(ctx->cuda_ctx, sizeof(int));
+        ctx->cuda_d_rope = (float *)vox_cuda_malloc(ctx->cuda_ctx, (head_dim / 2) * 2 * sizeof(float));
+        ctx->cuda_d_argmax = (int *)vox_cuda_malloc(ctx->cuda_ctx, sizeof(int));
     }
 #endif
 }
@@ -455,7 +460,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     /* RoPE uses logical position (physical + offset from compactions) */
     int logical_pos = ctx->kv_pos_offset + pos;
     int positions[1] = { logical_pos };
-    vox_compute_rope_freqs(rope_freqs, positions, 1, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(ctx->cuda_ctx, rope_freqs, positions, 1, head_dim, VOX_ROPE_THETA);
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
@@ -507,6 +512,9 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             vox_cuda_rms_norm(ctx->cuda_ctx, x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
             vox_cuda_matmul_bf16(ctx->cuda_ctx, VOX_VOCAB_SIZE, 1, dim, dec->tok_embeddings_bf16, x, logits, 0); 
             
+            /* Argmax on GPU */
+            vox_cuda_argmax(ctx->cuda_ctx, ctx->cuda_d_argmax, logits, VOX_VOCAB_SIZE);
+
             ctx->cuda_dec_graph_exec = vox_cuda_graph_end(ctx->cuda_ctx);
             ctx->cuda_dec_graph_captured = 1;
         }
@@ -514,16 +522,9 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         vox_cuda_graph_exec(ctx->cuda_dec_graph_exec);
         ctx->kv_cache_len = pos + 1;
         
-        // Argmax on CPU for now, or implement a CUDA argmax if needed.
-        int best = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
-            if (logits[i] > best_val) {
-                best_val = logits[i];
-                best = i;
-            }
-        }
-        return best;
+        int best_token = 0;
+        vox_cuda_copy_to_host(&best_token, ctx->cuda_d_argmax, sizeof(int));
+        return best_token;
     }
 #endif
 

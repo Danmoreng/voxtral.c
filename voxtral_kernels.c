@@ -945,7 +945,13 @@ void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const
  * Rotary Position Embeddings
  * ======================================================================== */
 
-void vox_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
+void vox_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, int seq, int dim, float theta) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_compute_rope_freqs(ctx, freqs, pos, seq, dim, theta);
+        return;
+    }
+#endif
     int half_dim = dim / 2;
 
     for (int s = 0; s < seq; s++) {

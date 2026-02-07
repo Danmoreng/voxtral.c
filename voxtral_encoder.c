@@ -152,12 +152,11 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     float *conv_in = (float *)vox_mem_malloc(VOX_MEL_BINS * mel_frames * sizeof(float));
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        /* mel is host memory (vox_malloc), but kernels need managed/device memory.
-           Copy to a temporary managed buffer. */
-        float *mel_managed = (float *)vox_mem_malloc(mel_frames * VOX_MEL_BINS * sizeof(float));
-        memcpy(mel_managed, mel, mel_frames * VOX_MEL_BINS * sizeof(float));
-        vox_cuda_transpose_mel(conv_in, mel_managed, mel_frames, VOX_MEL_BINS);
-        vox_mem_free(mel_managed);
+        /* mel is host memory, copy to device */
+        float *mel_gpu = (float *)vox_gpu_malloc(mel_frames * VOX_MEL_BINS * sizeof(float));
+        vox_mem_copy(mel_gpu, mel, mel_frames * VOX_MEL_BINS * sizeof(float));
+        vox_cuda_transpose_mel(ctx->cuda_ctx, conv_in, mel_gpu, mel_frames, VOX_MEL_BINS);
+        vox_gpu_free(mel_gpu);
     } else
 #endif
     {
@@ -190,7 +189,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
     float *x = (float *)vox_mem_malloc(seq_len * dim * sizeof(float));
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        vox_cuda_transpose_conv(x, conv1_out, seq_len, dim);
+        vox_cuda_transpose_conv(ctx->cuda_ctx, x, conv1_out, seq_len, dim);
     } else
 #endif
     {
@@ -218,9 +217,13 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
     /* RoPE frequencies */
     int *positions = (int *)vox_mem_malloc(seq_len * sizeof(int));
-    for (int i = 0; i < seq_len; i++) positions[i] = i;
+    int *pos_host = (int *)vox_cpu_malloc(seq_len * sizeof(int));
+    for (int i = 0; i < seq_len; i++) pos_host[i] = i;
+    vox_mem_copy(positions, pos_host, seq_len * sizeof(int));
+    vox_cpu_free(pos_host);
+
     float *rope_freqs = (float *)vox_mem_malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
-    vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(ctx->cuda_ctx, rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
         vox_enc_layer_t *l = &enc->layers[layer];
@@ -391,8 +394,8 @@ static int enc_kv_cache_grow(vox_ctx_t *ctx, int required) {
         size_t old_stride = (size_t)ctx->enc_kv_cache_max * ENC_KV_DIM;
         size_t copy = (size_t)ctx->enc_kv_cache_len * ENC_KV_DIM * sizeof(float);
         for (int l = 0; l < VOX_ENC_LAYERS; l++) {
-            memcpy(new_k + l * new_stride, ctx->enc_kv_cache_k + l * old_stride, copy);
-            memcpy(new_v + l * new_stride, ctx->enc_kv_cache_v + l * old_stride, copy);
+            vox_mem_copy(new_k + l * new_stride, ctx->enc_kv_cache_k + l * old_stride, copy);
+            vox_mem_copy(new_v + l * new_stride, ctx->enc_kv_cache_v + l * old_stride, copy);
         }
     }
 
@@ -416,8 +419,8 @@ static void enc_kv_cache_compact(vox_ctx_t *ctx) {
         float *k_src  = enc_kv_cache_k_at(ctx, l, discard);
         float *v_base = enc_kv_cache_v_at(ctx, l, 0);
         float *v_src  = enc_kv_cache_v_at(ctx, l, discard);
-        memmove(k_base, k_src, keep_bytes);
-        memmove(v_base, v_src, keep_bytes);
+        vox_mem_copy(k_base, k_src, keep_bytes);
+        vox_mem_copy(v_base, v_src, keep_bytes);
     }
 
     ctx->enc_kv_pos_offset += discard;
@@ -518,9 +521,13 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     /* RoPE frequencies for logical positions */
     int logical_start = ctx->enc_kv_pos_offset + cache_len;
     int *positions = ctx->enc_inc_positions;
-    for (int i = 0; i < new_len; i++) positions[i] = logical_start + i;
+    int *pos_host = (int *)vox_cpu_malloc(new_len * sizeof(int));
+    for (int i = 0; i < new_len; i++) pos_host[i] = logical_start + i;
+    vox_mem_copy(positions, pos_host, new_len * sizeof(int));
+    vox_cpu_free(pos_host);
+
     float *rope_freqs = ctx->enc_inc_rope_freqs;
-    vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(ctx->cuda_ctx, rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
 
     /* GPU monolithic path: all 32 layers in one command buffer */
 #ifdef USE_METAL
@@ -697,13 +704,7 @@ float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,
     int ds_dim = VOX_ENC_DIM * VOX_DOWNSAMPLE; /* 5120 */
 
     float *ds = (float *)vox_mem_malloc(ds_len * ds_dim * sizeof(float));
-    for (int i = 0; i < ds_len; i++) {
-        for (int j = 0; j < VOX_DOWNSAMPLE; j++) {
-            memcpy(ds + i * ds_dim + j * VOX_ENC_DIM,
-                   enc_out + (i * VOX_DOWNSAMPLE + j) * VOX_ENC_DIM,
-                   VOX_ENC_DIM * sizeof(float));
-        }
-    }
+    vox_mem_copy(ds, enc_out, (size_t)ds_len * ds_dim * sizeof(float));
 
     if (vox_verbose >= 2)
         fprintf(stderr, "  Adapter: %d -> %d (downsample %dx)\n",

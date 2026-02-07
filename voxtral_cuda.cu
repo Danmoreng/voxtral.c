@@ -15,6 +15,10 @@ struct vox_cuda_ctx {
     void *lt_workspace;
     size_t lt_workspace_size;
     
+    // Scratch buffer for activations conversion
+    void *act_scratch;
+    size_t act_scratch_size;
+
     // Graph state
     cudaGraph_t current_graph;
     cudaGraphExec_t current_exec;
@@ -67,6 +71,10 @@ vox_cuda_ctx_t *vox_cuda_init(void) {
     ctx->lt_workspace_size = 32 * 1024 * 1024; // 32MB workspace
     CUDA_CHECK(cudaMalloc(&ctx->lt_workspace, ctx->lt_workspace_size));
 
+    /* Scratch for BF16 conversion (max 32k * 4096 * 2 bytes = 256MB) */
+    ctx->act_scratch_size = 256 * 1024 * 1024;
+    CUDA_CHECK(cudaMalloc(&ctx->act_scratch, ctx->act_scratch_size));
+
     /* Setup Memory Pool if supported (CUDA 11.2+) */
     int memPoolSupported = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&memPoolSupported, cudaDevAttrMemoryPoolsSupported, ctx->device));
@@ -86,6 +94,7 @@ void vox_cuda_shutdown(vox_cuda_ctx_t *ctx) {
     if (ctx->current_exec) cudaGraphExecDestroy(ctx->current_exec);
     if (ctx->current_graph) cudaGraphDestroy(ctx->current_graph);
 
+    if (ctx->act_scratch) cudaFree(ctx->act_scratch);
     if (ctx->lt_workspace) cudaFree(ctx->lt_workspace);
     if (ctx->cublaslt_handle) cublasLtDestroy(ctx->cublaslt_handle);
     if (ctx->cublas_handle) cublasDestroy(ctx->cublas_handle);
@@ -153,6 +162,41 @@ void vox_cuda_graph_destroy(void *exec) {
     }
 }
 
+__device__ __forceinline__ float warp_reduce_max(float val, int &idx) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, idx, offset);
+        if (other_val > val) { val = other_val; idx = other_idx; }
+    }
+    return val;
+}
+
+__global__ void k_argmax(int *out, const float *logits, int n) {
+    int tid = threadIdx.x;
+    float max_val = -1e30f;
+    int max_idx = -1;
+    for (int i = tid; i < n; i += blockDim.x) {
+        if (logits[i] > max_val) { max_val = logits[i]; max_idx = i; }
+    }
+    max_val = warp_reduce_max(max_val, max_idx);
+    static __shared__ float s_max_val[32];
+    static __shared__ int s_max_idx[32];
+    int lane = tid % 32; int wid = tid / 32;
+    if (lane == 0) { s_max_val[wid] = max_val; s_max_idx[wid] = max_idx; }
+    __syncthreads();
+    if (wid == 0) {
+        max_val = (tid < (blockDim.x / 32)) ? s_max_val[lane] : -1e30f;
+        max_idx = (tid < (blockDim.x / 32)) ? s_max_idx[lane] : -1;
+        max_val = warp_reduce_max(max_val, max_idx);
+        if (tid == 0) *out = max_idx;
+    }
+}
+
+void vox_cuda_argmax(vox_cuda_ctx_t *ctx, int *out_gpu, const float *logits_gpu, int n) {
+    k_argmax<<<1, 256>>>(out_gpu, logits_gpu, n);
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void k_kv_cache_update(float *cache_k, float *cache_v, const float *k, const float *v, 
                                   int layer, const int *pos_ptr, int max_seq, int kv_dim) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -180,10 +224,32 @@ void vox_cuda_copy_to_host(void *dst, const void *src, size_t size) {
     CUDA_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost));
 }
 
+__global__ void k_f32_to_bf16(nv_bfloat16 *out, const float *in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+
 void vox_cuda_matmul_bf16(vox_cuda_ctx_t *ctx, int m, int n, int k, const void *a, const void *b, float *c, int transpose_b) {
     cublasLtMatmulDesc_t operationDesc = NULL;
     cublasLtMatrixLayout_t adesc = NULL, bdesc = NULL, cdesc = NULL;
     cublasLtMatmulPreference_t preference = NULL;
+
+    /* A is activations [m, k], B is weights [n, k] (row-major)
+       We want C = A * B^T -> [m, n]
+       In column-major: B is [k, n], A is [k, m]
+       C = op(B) * op(A) -> [n, m]
+       With op(B)=T (-> [n, k]), op(A)=N (-> [k, m]) -> [n, m] col-major, which is [m, n] row-major.
+    */
+
+    /* Convert activations 'a' from f32 to bf16 if needed */
+    const void *a_bf16 = a;
+    int total_a = m * k;
+    if (total_a > 0) {
+        int threads = 256;
+        int blocks = (total_a + threads - 1) / threads;
+        k_f32_to_bf16<<<blocks, threads>>>( (nv_bfloat16*)ctx->act_scratch, (const float*)a, total_a);
+        a_bf16 = ctx->act_scratch;
+    }
 
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
     
@@ -192,6 +258,7 @@ void vox_cuda_matmul_bf16(vox_cuda_ctx_t *ctx, int m, int n, int k, const void *
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
 
+    /* Layouts for column-major sgemm */
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&adesc, CUDA_R_16BF, k, n, k));
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&bdesc, CUDA_R_16BF, k, m, k));
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&cdesc, CUDA_R_32F, n, m, n));
@@ -206,7 +273,7 @@ void vox_cuda_matmul_bf16(vox_cuda_ctx_t *ctx, int m, int n, int k, const void *
     int returnedResults = 0;
     CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ctx->cublaslt_handle, operationDesc, adesc, bdesc, cdesc, cdesc, preference, 1, &heuristicResult, &returnedResults));
 
-    CUBLAS_CHECK(cublasLtMatmul(ctx->cublaslt_handle, operationDesc, &alpha, b, adesc, a, bdesc, &beta, c, cdesc, c, cdesc, &heuristicResult.algo, ctx->lt_workspace, ctx->lt_workspace_size, NULL));
+    CUBLAS_CHECK(cublasLtMatmul(ctx->cublaslt_handle, operationDesc, &alpha, b, adesc, a_bf16, bdesc, &beta, c, cdesc, c, cdesc, &heuristicResult.algo, ctx->lt_workspace, ctx->lt_workspace_size, NULL));
 
     cublasLtMatmulPreferenceDestroy(preference);
     cublasLtMatrixLayoutDestroy(cdesc);
@@ -214,7 +281,7 @@ void vox_cuda_matmul_bf16(vox_cuda_ctx_t *ctx, int m, int n, int k, const void *
     cublasLtMatrixLayoutDestroy(adesc);
     cublasLtMatmulDescDestroy(operationDesc);
     
-    if (!ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 /* Kernels implementation using ctx */
@@ -252,7 +319,6 @@ void vox_cuda_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const fl
     size_t shared_mem = threads * sizeof(float);
     k_rms_norm<<<n, threads, shared_mem>>>(out, x, weight, hidden, eps);
     if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
 }
 
 __global__ void k_silu(float *x, int n) {
@@ -300,7 +366,6 @@ void vox_cuda_rms_norm_residual(vox_cuda_ctx_t *ctx, float *out, float *x, const
     size_t shared_mem = threads * sizeof(float);
     k_rms_norm_residual<<<n, threads, shared_mem>>>(out, x, residual, weight, hidden, eps);
     if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
 }
 
 __global__ void k_rms_norm_ada_residual(float *out, float *x, const float *residual, const float *weight, const float *ada_scale, int hidden, float eps) {
@@ -310,7 +375,7 @@ __global__ void k_rms_norm_ada_residual(float *out, float *x, const float *resid
     float sum_sq = 0.0f;
     for (int i = tid; i < hidden; i += blockDim.x) {
         int idx = row * hidden + i;
-        float val = x[idx] + residual[idx];
+        float val = x[idx] + (residual ? residual[idx] : 0.0f);
         x[idx] = val;
         sum_sq += val * val;
     }
@@ -336,7 +401,6 @@ void vox_cuda_rms_norm_ada_residual(vox_cuda_ctx_t *ctx, float *out, float *x, c
     size_t shared_mem = threads * sizeof(float);
     k_rms_norm_ada_residual<<<n, threads, shared_mem>>>(out, x, residual, weight, ada_scale, hidden, eps);
     if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
 }
 
 __global__ void k_ffn_swiglu(float *out, const float *gate, const float *up, int n) {
@@ -353,7 +417,7 @@ void vox_cuda_ffn_swiglu(vox_cuda_ctx_t *ctx, float *out, const float *gate, con
 
 __global__ void k_gelu(float *x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { float val = x[i]; float x3 = val * val * val; out[i] = 0.5f * val * (1.0f + tanhf(0.7978845608f * (val + 0.044715f * x3))); }
+    if (i < n) { float val = x[i]; float x3 = val * val * val; x[i] = 0.5f * val * (1.0f + tanhf(0.7978845608f * (val + 0.044715f * x3))); }
 }
 
 void vox_cuda_gelu(vox_cuda_ctx_t *ctx, float *x, int n) {
@@ -372,7 +436,7 @@ void vox_cuda_add_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) 
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     k_add_inplace<<<blocks, threads>>>(a, b, n);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_mul_inplace(float *a, const float *b, int n) {
@@ -384,12 +448,12 @@ void vox_cuda_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) 
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     k_mul_inplace<<<blocks, threads>>>(a, b, n);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 void vox_cuda_axpy(vox_cuda_ctx_t *ctx, float *a, float scale, const float *b, int n) {
     CUBLAS_CHECK(cublasSaxpy(ctx->cublas_handle, n, &scale, b, 1, a, 1));
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_bias_add(float *y, const float *b, int seq_len, int out_dim) {
@@ -402,7 +466,7 @@ void vox_cuda_bias_add(vox_cuda_ctx_t *ctx, float *y, const float *b, int seq_le
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     k_bias_add<<<blocks, threads>>>(y, b, seq_len, out_dim);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_rope(float *x, const float *freqs, int seq, int heads, int head_dim) {
@@ -422,7 +486,29 @@ void vox_cuda_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, i
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     k_rope<<<blocks, threads>>>(x, freqs, seq, heads, head_dim);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_dim = dim / 2;
+    if (i < seq * half_dim) {
+        int s = i / half_dim;
+        int d = i % half_dim;
+        float p = (float)pos[s];
+        float freq = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
+        float angle = p * freq;
+        freqs[s * half_dim * 2 + d * 2] = cosf(angle);
+        freqs[s * half_dim * 2 + d * 2 + 1] = sinf(angle);
+    }
+}
+
+void vox_cuda_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, int seq, int dim, float theta) {
+    int total = seq * (dim / 2);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_compute_rope_freqs<<<blocks, threads>>>(freqs, pos, seq, dim, theta);
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
@@ -450,7 +536,7 @@ void vox_cuda_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, co
     dim3 threads(256);
     dim3 blocks((out_length + 255) / 256, channels_out);
     k_causal_conv1d<<<blocks, threads>>>(out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -561,7 +647,7 @@ void vox_cuda_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, 
         dim3 blocks(n_heads, seq_q); dim3 threads(256);
         k_causal_attention_prefill_opt<<<blocks, threads>>>(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset);
     }
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 void vox_cuda_causal_attention_ptr(vox_cuda_ctx_t *ctx, float *out, const float *Q, const float *K, const float *V,
@@ -584,7 +670,7 @@ __global__ void k_ada_scale(float *x, const float *scale, int n) {
 void vox_cuda_ada_scale(vox_cuda_ctx_t *ctx, float *x, const float *scale, int n) {
     int threads = 256; int blocks = (n + threads - 1) / threads;
     k_ada_scale<<<blocks, threads>>>(x, scale, n);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_transpose_mel(float *out, const float *in, int frames, int bins) {
@@ -595,7 +681,7 @@ __global__ void k_transpose_mel(float *out, const float *in, int frames, int bin
 void vox_cuda_transpose_mel(vox_cuda_ctx_t *ctx, float *out, const float *in, int frames, int bins) {
     dim3 threads(256); dim3 blocks((frames + 255) / 256, bins);
     k_transpose_mel<<<blocks, threads>>>(out, in, frames, bins);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_transpose_conv(float *out, const float *in, int seq_len, int dim) {
@@ -606,17 +692,17 @@ __global__ void k_transpose_conv(float *out, const float *in, int seq_len, int d
 void vox_cuda_transpose_conv(vox_cuda_ctx_t *ctx, float *out, const float *in, int seq_len, int dim) {
     dim3 threads(256); dim3 blocks((seq_len + 255) / 256, dim);
     k_transpose_conv<<<blocks, threads>>>(out, in, seq_len, dim);
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 void vox_cuda_sgemm(vox_cuda_ctx_t *ctx, int m, int n, int k, const float *a, const float *b, float *c) {
     float alpha = 1.0f; float beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(ctx->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, b, n, a, k, &beta, c, n));
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }
 
 void vox_cuda_sgemm_t(vox_cuda_ctx_t *ctx, int m, int n, int k, const float *a, const float *b, float *c) {
     float alpha = 1.0f; float beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(ctx->cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, b, k, a, k, &beta, c, n));
-    if (!ctx || !ctx->capturing) cudaDeviceSynchronize();
+    if (!ctx || !ctx->capturing) CUDA_CHECK(cudaGetLastError());
 }

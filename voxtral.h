@@ -24,6 +24,10 @@ void vox_mem_free(void *ptr);
 void vox_mem_copy(void *dst, const void *src, size_t size);
 char *vox_strdup(const char *s);
 
+/* vox_gpu_* functions for explicit device memory */
+void *vox_gpu_malloc(size_t size);
+void vox_gpu_free(void *ptr);
+
 /* vox_*_cpu functions manage standard CPU-only memory */
 void *vox_cpu_malloc(size_t size);
 void *vox_cpu_calloc(size_t count, size_t size);
@@ -229,6 +233,7 @@ struct vox_ctx {
     int *cuda_d_pos;        /* Device-side 'pos' for Graph */
     int *cuda_d_total_seq;  /* Device-side 'total_seq' for Graph */
     float *cuda_d_rope;     /* Device-side rope_freqs for Graph */
+    int *cuda_d_argmax;     /* Device-side argmax result for Graph */
 };
 
 /* ========================================================================

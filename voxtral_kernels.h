@@ -83,7 +83,7 @@ void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const
  * Rotary Position Embeddings
  * ======================================================================== */
 
-void vox_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta);
+void vox_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, int seq, int dim, float theta);
 void vox_apply_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, int heads, int head_dim);
 
 /* Global verbose flag */

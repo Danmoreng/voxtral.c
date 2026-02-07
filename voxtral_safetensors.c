@@ -237,30 +237,36 @@ safetensors_file_t *safetensors_open(const char *path) {
 #endif
         if (file_size < 8) { fclose(fp); return NULL; }
 
-        void *data = vox_mem_malloc(file_size);
-        if (!data) { fclose(fp); return NULL; }
+        void *host_data = vox_cpu_malloc(file_size);
+        if (!host_data) { fclose(fp); return NULL; }
 
-        size_t n = fread(data, 1, file_size, fp);
+        size_t n = fread(host_data, 1, file_size, fp);
         if (n != file_size) {
             fprintf(stderr, "safetensors_open: fread short %zu vs %zu\n", n, file_size);
-            vox_mem_free(data); fclose(fp); return NULL;
+            vox_cpu_free(host_data); fclose(fp); return NULL;
         }
         fclose(fp);
 
+        void *gpu_data = vox_gpu_malloc(file_size);
+        if (!gpu_data) { vox_cpu_free(host_data); return NULL; }
+        vox_mem_copy(gpu_data, host_data, file_size);
+
         /* Parse Header Size */
         uint64_t header_size = 0;
-        memcpy(&header_size, data, 8);
+        memcpy(&header_size, host_data, 8);
         
-        safetensors_file_t *sf = vox_mem_calloc(1, sizeof(safetensors_file_t));
+        safetensors_file_t *sf = vox_cpu_calloc(1, sizeof(safetensors_file_t));
         sf->path = vox_strdup(path);
-        sf->data = data;
+        sf->data = gpu_data;
         sf->file_size = file_size;
         sf->header_size = (size_t)header_size;
         sf->is_mmap = 0;
 
-        sf->header_json = vox_mem_malloc(header_size + 1);
-        memcpy(sf->header_json, (char*)data + 8, header_size);
+        sf->header_json = vox_cpu_malloc(header_size + 1);
+        memcpy(sf->header_json, (char*)host_data + 8, header_size);
         sf->header_json[header_size] = '\0';
+
+        vox_cpu_free(host_data);
 
         if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
         return sf;
@@ -427,12 +433,12 @@ void safetensors_close(safetensors_file_t *sf) {
             munmap(sf->data, sf->file_size);
 #endif
         } else {
-            vox_mem_free(sf->data);
+            vox_gpu_free(sf->data);
         }
     }
-    vox_mem_free(sf->path);
-    vox_mem_free(sf->header_json);
-    vox_mem_free(sf);
+    vox_cpu_free(sf->path);
+    vox_cpu_free(sf->header_json);
+    vox_cpu_free(sf);
 }
 
 const safetensor_t *safetensors_find(const safetensors_file_t *sf, const char *name) {
@@ -505,29 +511,47 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     size_t elem_size = (t->dtype == DTYPE_F32) ? 4 : 2;
     if ((size_t)n * elem_size > t->data_size) return NULL;
 
-    float *out = vox_mem_malloc(n * sizeof(float));
+    float *out = (float *)vox_mem_malloc(n * sizeof(float));
     if (!out) return NULL;
 
     const void *data = safetensors_data(sf, t);
 
     switch (t->dtype) {
         case DTYPE_F32:
-            memcpy(out, data, n * sizeof(float));
+            vox_mem_copy(out, data, n * sizeof(float));
             break;
 
         case DTYPE_F16: {
-            const uint16_t *src = (const uint16_t *)data;
+            uint16_t *src_host = (uint16_t *)vox_cpu_malloc(n * 2);
+#ifdef USE_CUDA
+            vox_cuda_copy_to_host(src_host, data, n * 2);
+#else
+            memcpy(src_host, data, n * 2);
+#endif
+            float *out_host = (float *)vox_cpu_malloc(n * 4);
             for (int64_t i = 0; i < n; i++) {
-                out[i] = f16_to_f32(src[i]);
+                out_host[i] = f16_to_f32(src_host[i]);
             }
+            vox_mem_copy(out, out_host, n * 4);
+            vox_cpu_free(src_host);
+            vox_cpu_free(out_host);
             break;
         }
 
         case DTYPE_BF16: {
-            const uint16_t *src = (const uint16_t *)data;
+            uint16_t *src_host = (uint16_t *)vox_cpu_malloc(n * 2);
+#ifdef USE_CUDA
+            vox_cuda_copy_to_host(src_host, data, n * 2);
+#else
+            memcpy(src_host, data, n * 2);
+#endif
+            float *out_host = (float *)vox_cpu_malloc(n * 4);
             for (int64_t i = 0; i < n; i++) {
-                out[i] = bf16_to_f32(src[i]);
+                out_host[i] = bf16_to_f32(src_host[i]);
             }
+            vox_mem_copy(out, out_host, n * 4);
+            vox_cpu_free(src_host);
+            vox_cpu_free(out_host);
             break;
         }
 
@@ -561,7 +585,7 @@ uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t 
     uint16_t *out = (uint16_t *)vox_mem_malloc(n * sizeof(uint16_t));
     if (!out) return NULL;
 
-    memcpy(out, data, n * sizeof(uint16_t));
+    vox_mem_copy(out, data, n * sizeof(uint16_t));
     return out;
 }
 

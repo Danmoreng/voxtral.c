@@ -42,20 +42,41 @@ void vox_cpu_free(void *ptr) {
     free(ptr);
 }
 
-/* vox_mem_* functions: potentially GPU-accessible managed memory */
-void *vox_mem_malloc(size_t size) {
+/* vox_mem_* functions: potentially GPU-accessible device memory */
+void *vox_gpu_malloc(size_t size) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        return vox_cuda_malloc_managed(size);
+        return vox_cuda_malloc(NULL, size);
     }
 #endif
     return malloc(size);
 }
 
+void vox_gpu_free(void *ptr) {
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_free(NULL, ptr);
+        return;
+    }
+#endif
+    free(ptr);
+}
+
+void *vox_mem_malloc(size_t size) {
+    return vox_gpu_malloc(size);
+}
+
 void *vox_mem_calloc(size_t count, size_t size) {
     size_t total = count * size;
     void *ptr = vox_mem_malloc(total);
-    if (ptr) memset(ptr, 0, total);
+    if (ptr) {
+#ifdef USE_CUDA
+        if (vox_cuda_available()) {
+            cudaMemset(ptr, 0, total);
+        } else
+#endif
+        memset(ptr, 0, total);
+    }
     return ptr;
 }
 
@@ -90,10 +111,7 @@ void vox_mem_free(void *ptr) {
 void vox_mem_copy(void *dst, const void *src, size_t size) {
 #ifdef USE_CUDA
     if (vox_cuda_available()) {
-        /* If both are managed, we can use memcpy, but cudaMemcpy is safer
-           if one might be on device and other on host?
-           Unified memory allows both. */
-        memcpy(dst, src, size);
+        cudaMemcpy(dst, src, size, cudaMemcpyDefault);
         return;
     }
 #endif
@@ -223,6 +241,7 @@ void vox_free(vox_ctx_t *ctx) {
     vox_mem_free(ctx->cuda_d_pos);
     vox_mem_free(ctx->cuda_d_total_seq);
     vox_mem_free(ctx->cuda_d_rope);
+    vox_mem_free(ctx->cuda_d_argmax);
     if (ctx->cuda_ctx) vox_cuda_shutdown(ctx->cuda_ctx);
 #endif
 
