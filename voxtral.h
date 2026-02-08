@@ -11,25 +11,35 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* Windows/POSIX Portability */
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <io.h>
-#include <direct.h>
-#define strdup _strdup
-#else
-#include <sys/time.h>
-#include <unistd.h>
-#endif
+/* Forward declarations */
+typedef struct vox_cuda_ctx vox_cuda_ctx_t;
+typedef struct vox_tokenizer vox_tokenizer_t;
+typedef struct vox_ctx vox_ctx_t;
 
-/* Cross-platform time in milliseconds (monotonic-ish). */
-double vox_get_time_ms(void);
+typedef enum {
+    VOX_BACKEND_CPU = 0,
+    VOX_BACKEND_CUDA = 1,
+    VOX_BACKEND_METAL = 2
+} vox_backend_t;
+
+/* Memory management */
+/* vox_mem_* functions manage memory that MAY be accessed by GPU (managed/unified) */
+void *vox_mem_malloc(size_t size);
+void *vox_mem_calloc(size_t count, size_t size);
+void *vox_mem_realloc(void *ptr, size_t size);
+void vox_mem_free(void *ptr);
+void vox_mem_copy(void *dst, const void *src, size_t size);
+char *vox_strdup(const char *s);
+
+/* vox_gpu_* functions for explicit device memory */
+void *vox_gpu_malloc(size_t size);
+void vox_gpu_free(void *ptr);
+
+/* vox_*_cpu functions manage standard CPU-only memory */
+void *vox_cpu_malloc(size_t size);
+void *vox_cpu_calloc(size_t count, size_t size);
+void *vox_cpu_realloc(void *ptr, size_t size);
+void vox_cpu_free(void *ptr);
 
 /* ========================================================================
  * Model Constants
@@ -171,10 +181,13 @@ typedef struct {
  * Main Context
  * ======================================================================== */
 
-typedef struct {
+struct vox_ctx {
     vox_encoder_t encoder;
     vox_adapter_t adapter;
     vox_decoder_t decoder;
+    vox_tokenizer_t *tokenizer;
+
+    vox_backend_t backend;
 
     /* Model file (kept open for mmap) */
     void *safetensors;       /* safetensors_file_t* */
@@ -219,8 +232,21 @@ typedef struct {
     float *dec_attn_out, *dec_proj_out;
     float *dec_gate, *dec_up, *dec_ffn_out;
     float *dec_rope_freqs;
-    float *dec_logits; /* Optional: only used if caller passes logits=NULL */
-} vox_ctx_t;
+    float *dec_logits;
+
+    /* CUDA context */
+    vox_cuda_ctx_t *cuda_ctx;
+
+    /* CUDA Graph objects */
+    void *cuda_dec_graph_exec;
+    void *cuda_enc_graph_exec;
+    int cuda_dec_graph_captured;
+    int cuda_enc_graph_captured;
+    int *cuda_d_pos;        /* Device-side 'pos' for Graph */
+    int *cuda_d_total_seq;  /* Device-side 'total_seq' for Graph */
+    float *cuda_d_rope;     /* Device-side rope_freqs for Graph */
+    int *cuda_d_argmax;     /* Device-side argmax result for Graph */
+};
 
 /* ========================================================================
  * Alternative Tokens
@@ -233,7 +259,7 @@ typedef struct {
  * ======================================================================== */
 
 /* Load model from directory containing consolidated.safetensors + tekken.json */
-vox_ctx_t *vox_load(const char *model_dir);
+vox_ctx_t *vox_load(const char *model_dir, vox_backend_t backend);
 
 /* Free all resources */
 void vox_free(vox_ctx_t *ctx);
@@ -242,7 +268,7 @@ void vox_free(vox_ctx_t *ctx);
 void vox_set_delay(vox_ctx_t *ctx, int delay_ms);
 
 /* ========================================================================
- * Streaming API — works for both real-time and offline transcription
+ * Streaming API ÔÇö works for both real-time and offline transcription
  *
  * Usage:
  *   vox_stream_t *s = vox_stream_init(ctx);
@@ -269,6 +295,10 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples);
  * and remaining token generation. Returns 0 on success, -1 on error. */
 int vox_stream_finish(vox_stream_t *s);
 
+/* Force the encoder to process whatever audio is buffered, regardless of the
+ * processing interval. Useful for flushing on silence detection. */
+int vox_stream_flush(vox_stream_t *s);
+
 /* Retrieve pending decoded token strings. Fills out_tokens with up to max
  * pointers to token text. Pointers are valid until vox_stream_free().
  * Returns number of tokens written (0 = nothing pending). */
@@ -294,10 +324,6 @@ int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
  * finish() always processes all remaining data regardless. */
 void vox_set_processing_interval(vox_stream_t *s, float seconds);
 
-/* Force the encoder to process whatever audio is buffered, regardless of the
- * processing interval. Useful for flushing on silence detection. */
-int vox_stream_flush(vox_stream_t *s);
-
 /* Free streaming context and all resources. */
 void vox_stream_free(vox_stream_t *s);
 
@@ -317,6 +343,12 @@ char *vox_transcribe_stdin(vox_ctx_t *ctx);
 /* ========================================================================
  * Internal Functions (used by encoder/decoder implementations)
  * ======================================================================== */
+
+#include "voxtral_safetensors.h"
+
+int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf);
+int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf);
+int vox_adapter_load(vox_adapter_t *ada, safetensors_file_t *sf);
 
 /* Audio encoder forward pass (full, non-incremental) */
 float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,

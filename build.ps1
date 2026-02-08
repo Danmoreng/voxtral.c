@@ -51,12 +51,7 @@ function Import-VSEnv {
 # Main routine
 # ---------------------------------------------------------------------------
 
-$SRCS = "voxtral.c", "voxtral_kernels.c", "voxtral_audio.c", "voxtral_encoder.c", "voxtral_decoder.c", "voxtral_tokenizer.c", "voxtral_safetensors.c", "main.c"
-if ($true) { # Since build.ps1 is only for Windows
-    $SRCS += "voxtral_mic_win32.c"
-} else {
-    $SRCS += "voxtral_mic_macos.c"
-}
+$SRCS = "voxtral.c", "voxtral_kernels.c", "voxtral_audio.c", "voxtral_encoder.c", "voxtral_decoder.c", "voxtral_tokenizer.c", "voxtral_safetensors.c", "voxtral_mic_macos.c", "main.c"
 $TARGET = "voxtral.exe"
 
 if ($Clean) {
@@ -111,7 +106,7 @@ if ($Cuda) {
         $CUDA_LIB_PATH = Join-Path $env:CUDA_PATH "lib\x64"
     } else {
         # Try default location
-        $CUDA_LIB_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\lib\x64" # Adjust version if needed logic
+        $CUDA_LIB_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\lib\x64" # Adjust version if needed logic
         if (-not (Test-Path $CUDA_LIB_PATH)) {
              Write-Warning "Could not guess CUDA lib path. Linking might fail."
         }
@@ -151,7 +146,7 @@ if ($CC -eq "gcc") {
 } else {
     # MSVC (cl.exe)
     $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
-    $LINK_FLAGS = "ole32.lib uuid.lib mmdevapi.lib"
+    $LINK_FLAGS = ""
     
     if ($Debug) {
         $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
@@ -169,8 +164,7 @@ if ($CC -eq "gcc") {
     
     if ($Cuda) {
         Write-Host "Generating CUDA kernel header..."
-        # Run in current session so MSVC environment is preserved
-        & (Join-Path $PSScriptRoot "scripts\gen_cuda_header.ps1")
+        powershell.exe -ExecutionPolicy Bypass -File scripts\gen_cuda_header.ps1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         
         $CFLAGS += "/DUSE_CUDA"
@@ -179,7 +173,7 @@ if ($CC -eq "gcc") {
             $CFLAGS += "/I`"$CUDA_INC_PATH`""
         }
         $SRCS += "voxtral_cuda.c"
-        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cuda.lib cudart.lib cublas.lib cublaslt.lib"
+        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cuda.lib cublas.lib cublaslt.lib"
     } else {
         $SRCS += "voxtral_cuda_stub.c"
     }
