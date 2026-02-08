@@ -11,7 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 #include <limits.h>
 
 #include "voxtral_cuda_kernels_cubin.h"
@@ -202,9 +208,15 @@ static int mempool_wanted(void) {
 static size_t host_page_size(void) {
     static size_t cached = 0;
     if (cached) return cached;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cached = si.dwPageSize;
+#else
     long p = sysconf(_SC_PAGESIZE);
     if (p <= 0) p = 4096;
     cached = (size_t)p;
+#endif
     return cached;
 }
 
@@ -3138,16 +3150,16 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
 
         float *conv0_out = (float *)malloc((size_t)dim * (size_t)conv0_out_len * sizeof(float));
         if (!conv0_out) { free(conv_in); return 0; }
-        vox_causal_conv1d(conv0_out, conv_in, enc->conv0_weight, enc->conv0_bias,
+        vox_causal_conv1d(NULL, conv0_out, conv_in, enc->conv0_weight, enc->conv0_bias,
                           VOX_MEL_BINS, dim, mel_frames, 3, 1);
-        vox_gelu(conv0_out, dim * conv0_out_len);
+        vox_gelu(NULL, conv0_out, dim * conv0_out_len);
         free(conv_in);
 
         float *conv1_out = (float *)malloc((size_t)dim * (size_t)conv1_out_len * sizeof(float));
         if (!conv1_out) { free(conv0_out); return 0; }
-        vox_causal_conv1d(conv1_out, conv0_out, enc->conv1_weight, enc->conv1_bias,
+        vox_causal_conv1d(NULL, conv1_out, conv0_out, enc->conv1_weight, enc->conv1_bias,
                           dim, dim, conv0_out_len, 3, 2);
-        vox_gelu(conv1_out, dim * conv1_out_len);
+        vox_gelu(NULL, conv1_out, dim * conv1_out_len);
         free(conv0_out);
 
         x_host = (float *)malloc((size_t)seq_len * (size_t)dim * sizeof(float));
@@ -3182,7 +3194,7 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
     float *rope_host = (float *)malloc((size_t)seq_len * (size_t)rope_cols * sizeof(float));
     if (!positions || !rope_host) { free(positions); free(rope_host); free(x_host); return 0; }
     for (int i = 0; i < seq_len; i++) positions[i] = i;
-    vox_compute_rope_freqs(rope_host, positions, seq_len, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(NULL, rope_host, positions, seq_len, head_dim, VOX_ROPE_THETA);
     free(positions);
 
     (void)cuCtxSetCurrent(g_ctx);
@@ -3827,7 +3839,7 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     int logical_pos = ctx->kv_pos_offset + pos;
     int positions[1] = { logical_pos };
     float rope_host[(VOX_DEC_HEAD_DIM / 2) * 2];
-    vox_compute_rope_freqs(rope_host, positions, 1, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(NULL, rope_host, positions, 1, head_dim, VOX_ROPE_THETA);
     r = cuMemcpyHtoDAsync(g_dec_rope_freqs, rope_host, sizeof(rope_host), g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_rope_graph)", r); return 0; }
 
@@ -3917,7 +3929,7 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     int logical_pos = ctx->kv_pos_offset + pos;
     int positions[1] = { logical_pos };
     float rope_host[(VOX_DEC_HEAD_DIM / 2) * 2];
-    vox_compute_rope_freqs(rope_host, positions, 1, head_dim, VOX_ROPE_THETA);
+    vox_compute_rope_freqs(NULL, rope_host, positions, 1, head_dim, VOX_ROPE_THETA);
     if (!ensure_buffer(&g_dec_rope_freqs, &g_cap_dec_rope, sizeof(rope_host))) return 0;
     r = cuMemcpyHtoDAsync(g_dec_rope_freqs, rope_host, sizeof(rope_host), g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_rope)", r); return 0; }
