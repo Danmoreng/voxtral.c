@@ -1,7 +1,7 @@
 param(
     [string]$CuFile = "voxtral_cuda_kernels.cu",
     [string]$HFile = "voxtral_cuda_kernels_cubin.h",
-    [string]$Arch = "sm_86"
+    [string]$Arch = "native"
 )
 
 # Use current directory if not specified

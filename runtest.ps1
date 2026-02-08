@@ -67,10 +67,10 @@ function Run-Test($name, $cmd, $cmdArgs, $requireCuda = $false) {
     # Run and stream output
     & $cmd $cmdArgs 2>&1 | ForEach-Object {
         $line = $_.ToString()
-        if ($line -match "^[kernels] backend=CUDA") {
+        if ($line -match "\[kernels\] backend=CUDA") {
             $global:SAW_CUDA = $true
             Write-Host "  [status] $line" -ForegroundColor Green
-        } elseif ($line -match "^Loading|^Metal|^Model|^Audio:|^Encoder:|^Decoder:|^\[DEBUG\]|^\[kernels\]") {
+        } elseif ($line -match "Loading|Metal|Model|Audio:|Encoder:|Decoder:|\\\[DEBUG\\\]|\\\[kernels\\\]|\\\[cuda\\\]") {
             Write-Host "  [status] $line" -ForegroundColor Cyan
         } else {
             Write-Host $line -NoNewline
@@ -97,7 +97,10 @@ if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
     
     cmd /c "$ffmpeg_cmd | $voxtral_cmd" 2>&1 | ForEach-Object {
         $line = $_.ToString()
-        if ($line -match "^Loading|^Metal|^Model|^Audio:|^Encoder:|^Decoder:|^\[DEBUG\]") {
+        if ($line -match "\[kernels\] backend=CUDA") {
+            $global:SAW_CUDA = $true
+            Write-Host "  [status] $line" -ForegroundColor Green
+        } elseif ($line -match "Loading|Metal|Model|Audio:|Encoder:|Decoder:|\\\[DEBUG\\\]|\\\[kernels\\\]|\\\[cuda\\\]") {
             Write-Host "  [status] $line" -ForegroundColor Cyan
         } else {
             Write-Host $line -NoNewline
