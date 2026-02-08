@@ -24,8 +24,6 @@
 #define close _close
 #define read _read
 #define open _open
-#define fstat _fstat64
-#define stat _stat64
 #else
 #include <sys/time.h>
 #include <unistd.h>

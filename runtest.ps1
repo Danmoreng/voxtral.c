@@ -23,7 +23,7 @@ if (-not (Test-Path $VOXTRAL)) {
     exit 1
 }
 if (-not (Test-Path $MODEL_DIR)) {
-    Write-Host "FAIL: $MODEL_DIR not found. Run .\\download_model.ps1 first."
+    Write-Host "FAIL: $MODEL_DIR not found. Run ./download_model.ps1 first."
     exit 1
 }
 if (-not (Test-Path $INPUT)) {
@@ -67,10 +67,10 @@ function Run-Test($name, $cmd, $cmdArgs, $requireCuda = $false) {
     # Run and stream output
     & $cmd $cmdArgs 2>&1 | ForEach-Object {
         $line = $_.ToString()
-        if ($line -match "\[kernels\] backend=CUDA") {
+        if ($line -match "^[kernels] backend=CUDA") {
             $global:SAW_CUDA = $true
             Write-Host "  [status] $line" -ForegroundColor Green
-        } elseif ($line -match "Loading|Metal|Model|Audio:|Encoder:|Decoder:|\\\[DEBUG\\\]|\\\[kernels\\\]|\\\[cuda\\\]") {
+        } elseif ($line -match "^Loading|^Metal|^Model|^Audio:|^Encoder:|^Decoder:|^\[DEBUG\]|^\[kernels\]") {
             Write-Host "  [status] $line" -ForegroundColor Cyan
         } else {
             Write-Host $line -NoNewline
@@ -97,10 +97,7 @@ if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
     
     cmd /c "$ffmpeg_cmd | $voxtral_cmd" 2>&1 | ForEach-Object {
         $line = $_.ToString()
-        if ($line -match "\[kernels\] backend=CUDA") {
-            $global:SAW_CUDA = $true
-            Write-Host "  [status] $line" -ForegroundColor Green
-        } elseif ($line -match "Loading|Metal|Model|Audio:|Encoder:|Decoder:|\\\[DEBUG\\\]|\\\[kernels\\\]|\\\[cuda\\\]") {
+        if ($line -match "^Loading|^Metal|^Model|^Audio:|^Encoder:|^Decoder:|^\[DEBUG\]") {
             Write-Host "  [status] $line" -ForegroundColor Cyan
         } else {
             Write-Host $line -NoNewline
