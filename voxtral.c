@@ -1702,6 +1702,12 @@ void vox_set_processing_interval(vox_stream_t *s, float seconds) {
     /* mel rate = sample_rate / hop_length = 16000/160 = 100 fps */
     s->min_new_mel = (int)(seconds * 100.0f);
     if (s->min_new_mel < 1) s->min_new_mel = 1;
+
+    /* Update chunk_new_mel for CUDA path as well, unless overridden by environment */
+    if (!s->chunk_user_override) {
+        s->chunk_new_mel = s->min_new_mel;
+        if (s->chunk_new_mel < 50) s->chunk_new_mel = 50; /* Minimum 0.5 second for CUDA */
+    }
 }
 
 void vox_set_delay(vox_ctx_t *ctx, int delay_ms) {
