@@ -173,7 +173,7 @@ if ($CC -eq "gcc") {
             $CFLAGS += "/I`"$CUDA_INC_PATH`""
         }
         $SRCS += "voxtral_cuda.c"
-        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cuda.lib cublas.lib cublaslt.lib"
+        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cuda.lib cudart.lib cublas.lib cublaslt.lib"
     } else {
         $SRCS += "voxtral_cuda_stub.c"
     }
