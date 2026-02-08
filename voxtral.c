@@ -21,7 +21,24 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
-#include <sys/time.h>
+
+double vox_get_time_ms(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    static int started = 0;
+    if (!started) {
+        QueryPerformanceFrequency(&frequency);
+        started = 1;
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)frequency.QuadPart;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+#endif
+}
 
 /* Global verbose flag */
 int vox_verbose = 0;
@@ -811,8 +828,7 @@ static void stream_run_encoder(vox_stream_t *s) {
             int slice_len = slice_end - slice_start;
             if (slice_len <= 0) break;
 
-            struct timeval t0, t1;
-            gettimeofday(&t0, NULL);
+            double t0 = vox_get_time_ms();
 
             float *adapter_chunk = NULL;
             int chunk_tokens = 0;
@@ -858,9 +874,7 @@ static void stream_run_encoder(vox_stream_t *s) {
                 if (new_enc_len > 0 && !adapter_chunk) break;
             }
 
-            gettimeofday(&t1, NULL);
-            s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+            s->encoder_ms += vox_get_time_ms() - t0;
 
             if (chunk_tokens > 0) {
                 if (stream_use_cuda_pipeline_full() && !adapter_chunk) {
@@ -898,8 +912,7 @@ static void stream_run_encoder(vox_stream_t *s) {
     if (new_mel < need_mel && !s->finished) return;
     if (new_mel <= 0) return;
 
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    double t0 = vox_get_time_ms();
 
     /* 1. Run incremental conv stem on new mel -> post-conv positions */
     int conv_out_len = 0;
@@ -986,9 +999,7 @@ static void stream_run_encoder(vox_stream_t *s) {
 
     free(enc_out);
 
-    gettimeofday(&t1, NULL);
-    s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                     (t1.tv_usec - t0.tv_usec) / 1000.0;
+    s->encoder_ms += vox_get_time_ms() - t0;
 
     if (vox_verbose >= 2)
         fprintf(stderr, "  Encoder inc: %d mel -> %d conv -> %d usable (total adapter: %d, residual: %d)\n",
@@ -1056,7 +1067,7 @@ static void stream_fill_alts(vox_stream_t *s, int best_token,
 
 /* Run decoder: prefill if needed, then generate tokens while adapter available */
 static void stream_run_decoder(vox_stream_t *s) {
-    struct timeval t0, t1;
+    double t0;
     int dim = VOX_DEC_DIM;
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
@@ -1065,7 +1076,7 @@ static void stream_run_decoder(vox_stream_t *s) {
 
     /* Prefill when we have enough adapter tokens */
     if (!s->decoder_started && s->total_adapter >= prompt_len) {
-        gettimeofday(&t0, NULL);
+        t0 = vox_get_time_ms();
 
         float *prompt_embeds = (float *)malloc((size_t)prompt_len * dim * sizeof(float));
         if (!prompt_embeds) return;
@@ -1135,9 +1146,7 @@ static void stream_run_decoder(vox_stream_t *s) {
         s->gen_pos = prompt_len;
         s->decoder_started = 1;
 
-        gettimeofday(&t1, NULL);
-        double pf_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                       (t1.tv_usec - t0.tv_usec) / 1000.0;
+        double pf_ms = vox_get_time_ms() - t0;
         s->decoder_ms += pf_ms;
         s->prefill_ms += pf_ms;
 
@@ -1148,7 +1157,7 @@ static void stream_run_decoder(vox_stream_t *s) {
 
     /* Generate tokens while adapter tokens are available */
     if (s->decoder_started && !s->eos_seen) {
-        gettimeofday(&t0, NULL);
+        t0 = vox_get_time_ms();
         int gen_before = s->n_generated;
         while (s->gen_pos < s->total_adapter) {
             if (stream_use_cuda_pipeline_full()) {
@@ -1187,9 +1196,7 @@ static void stream_run_decoder(vox_stream_t *s) {
             }
         }
         if (s->n_generated > gen_before) {
-            gettimeofday(&t1, NULL);
-            s->decoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+            s->decoder_ms += vox_get_time_ms() - t0;
         }
     }
 }

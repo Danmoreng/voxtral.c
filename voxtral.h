@@ -11,6 +11,29 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Windows/POSIX Portability */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#define strcasecmp _stricmp
+#define strdup _strdup
+#define close _close
+#define read _read
+#define open _open
+#define fstat _fstat64
+#define stat _stat64
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#include <strings.h>
+#endif
+
+double vox_get_time_ms(void);
+
 /* ========================================================================
  * Model Constants
  * ======================================================================== */
