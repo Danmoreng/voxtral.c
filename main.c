@@ -205,6 +205,10 @@ int main(int argc, char **argv) {
         feed_chunk = (int)(interval * VOX_SAMPLE_RATE);
         if (feed_chunk < 160) feed_chunk = 160;
         if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
+    } else if (use_mic) {
+        /* Default for mic: 0.5s updates for better responsiveness */
+        vox_set_processing_interval(s, 0.5f);
+        feed_chunk = 8000;
     }
 
     double t0_run_ms = 0;
@@ -244,18 +248,18 @@ int main(int argc, char **argv) {
         while (!mic_interrupted) {
             /* Over-buffer detection */
             int avail = vox_mic_read_available();
-            if (avail > 80000) { /* > 5 seconds buffered */
+            if (avail > 160000) { /* > 10 seconds buffered */
                 if (!overbuf_warned) {
                     fprintf(stderr, "Warning: can't keep up, skipping audio\n");
                     overbuf_warned = 1;
                 }
-                /* Drain all but last ~1 second */
+                /* Drain all but last ~2 seconds */
                 float discard[4800];
-                while (vox_mic_read_available() > 16000)
+                while (vox_mic_read_available() > 32000)
                     vox_mic_read(discard, 4800);
                 silence_count = 0;
                 was_skipping = 0;
-            } else if (avail < 32000) { /* < 2 seconds: clear warning */
+            } else if (avail < 64000) { /* < 4 seconds: clear warning */
                 overbuf_warned = 0;
             }
 

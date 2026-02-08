@@ -51,7 +51,12 @@ function Import-VSEnv {
 # Main routine
 # ---------------------------------------------------------------------------
 
-$SRCS = "voxtral.c", "voxtral_kernels.c", "voxtral_audio.c", "voxtral_encoder.c", "voxtral_decoder.c", "voxtral_tokenizer.c", "voxtral_safetensors.c", "voxtral_mic_macos.c", "main.c"
+$SRCS = "voxtral.c", "voxtral_kernels.c", "voxtral_audio.c", "voxtral_encoder.c", "voxtral_decoder.c", "voxtral_tokenizer.c", "voxtral_safetensors.c", "main.c"
+if ($true) { # Since build.ps1 is only for Windows
+    $SRCS += "voxtral_mic_win32.c"
+} else {
+    $SRCS += "voxtral_mic_macos.c"
+}
 $TARGET = "voxtral.exe"
 
 if ($Clean) {
@@ -146,7 +151,7 @@ if ($CC -eq "gcc") {
 } else {
     # MSVC (cl.exe)
     $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
-    $LINK_FLAGS = ""
+    $LINK_FLAGS = "ole32.lib uuid.lib mmdevapi.lib"
     
     if ($Debug) {
         $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
