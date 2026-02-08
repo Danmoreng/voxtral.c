@@ -218,8 +218,13 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_fstat64(fd, &st) < 0) {
+#else
     struct stat st;
     if (fstat(fd, &st) < 0) {
+#endif
         perror("safetensors_open: fstat failed");
         close(fd);
         return NULL;
