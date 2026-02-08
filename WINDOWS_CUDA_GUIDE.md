@@ -1,6 +1,6 @@
 # Voxtral: Windows CUDA & Real-time Guide
 
-This guide explains how to build and use Voxtral on Windows, with optional NVIDIA CUDA acceleration and native microphone support via WASAPI.
+This guide explains how to build and use the `cuda-fork-merge` branch of Voxtral on Windows. This branch features an optimized CUDA backend (supporting Blackwell/RTX 50-series) and native Windows microphone support via WASAPI.
 
 ## Prerequisites
 
@@ -12,13 +12,6 @@ This guide explains how to build and use Voxtral on Windows, with optional NVIDI
 ## Building
 
 The project uses a unified `build.ps1` script that automatically detects your Visual Studio environment.
-
-## Downloading The Model
-
-Download the Voxtral model into `voxtral-model/`:
-```powershell
-.\download_model.ps1
-```
 
 ### 1. Build with CUDA (Recommended)
 This enables GPU acceleration for the encoder and decoder, providing near-instant transcription.
@@ -77,6 +70,6 @@ In `--debug` mode, you can monitor how the system is keeping up:
 ## Regression Testing
 To verify that your build is working correctly and producing accurate text:
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\runtest.ps1
+powershell -ExecutionPolicy Bypass -File .untest.ps1
 ```
 This script checks batch-cpu, batch-cuda, and streaming modes against known phrases.
