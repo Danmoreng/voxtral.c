@@ -455,8 +455,9 @@ struct vox_stream {
 
     /* Adapter output buffer (growing) */
     float *adapter_buf;
-    int total_adapter;
+    int total_adapter;      /* total logical tokens produced */
     int adapter_cap;
+    int adapter_pos_offset; /* logical offset from compactions */
 
     /* Decoder state */
     int decoder_started;
@@ -743,65 +744,24 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
     return result;
 }
 
+/* Compact adapter buffer: discard tokens the decoder has already consumed */
+static void stream_adapter_compact(vox_stream_t *s) {
+    if (!s->adapter_buf) return;
+    int consumed = s->gen_pos - s->adapter_pos_offset;
+    if (consumed <= 0) return;
+
+    int dim = VOX_DEC_DIM;
+    int remaining = (s->total_adapter - s->adapter_pos_offset) - consumed;
+
+    if (remaining > 0)
+        memmove(s->adapter_buf,
+                s->adapter_buf + (size_t)consumed * dim,
+                (size_t)remaining * dim * sizeof(float));
+
+    s->adapter_pos_offset += consumed;
+}
+
 /* Return non-zero if we should use the CUDA full encoder+adapter path.
- * This path is chunked (re-encodes overlap) and prioritizes throughput. */
-static int stream_use_cuda_encoder_full(void) {
-#ifdef USE_CUDA
-    static int cached = -1;
-    if (cached != -1) return cached;
-
-    const char *disable = getenv("VOX_DISABLE_CUDA_ENCODER_FULL");
-    if (disable && disable[0] && disable[0] != '0') {
-        cached = 0;
-        return cached;
-    }
-    cached = vox_cuda_available();
-    return cached;
-#else
-    return 0;
-#endif
-}
-
-/* Optional: keep adapter embeddings on device and let CUDA build the decoder step
- * embeddings directly from the adapter buffer (opt-in via VOX_CUDA_PIPELINE_FULL=1). */
-static int stream_use_cuda_pipeline_full(void) {
-#ifdef USE_CUDA
-    static int cached = -1;
-    if (cached != -1) return cached;
-
-    const char *disable = getenv("VOX_DISABLE_CUDA_PIPELINE_FULL");
-    if (disable && disable[0] && disable[0] != '0') {
-        cached = 0;
-        return cached;
-    }
-
-    const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
-    if (!env || !env[0] || env[0] == '0') {
-        cached = 0;
-        return cached;
-    }
-
-    /* Requires the full CUDA encoder path since we rely on device-side adapter output. */
-    cached = stream_use_cuda_encoder_full();
-    return cached;
-#else
-    return 0;
-#endif
-}
-
-/* Streaming EOS handling:
- * - Default behavior is to treat EOS as provisional until finish() is called,
- *   so long-running streams (e.g. microphone) don't get stuck after a flush.
- * - Set VOX_STREAM_STRICT_EOS=1 to stop decoding as soon as EOS is produced. */
-static int stream_strict_eos(void) {
-    static int cached = -1;
-    if (cached != -1) return cached;
-    const char *env = getenv("VOX_STREAM_STRICT_EOS");
-    cached = (env && env[0] && env[0] != '0');
-    return cached;
-}
-
-/* Run encoder on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
     float *mel_data = vox_mel_data(s->mel_ctx, &total_mel);
@@ -893,16 +853,17 @@ static void stream_run_encoder(vox_stream_t *s) {
                     /* Device-side adapter buffer was appended by CUDA. */
                     s->total_adapter += chunk_tokens;
                 } else if (adapter_chunk) {
-                    if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+                    int phys_len = s->total_adapter - s->adapter_pos_offset;
+                    if (phys_len + chunk_tokens > s->adapter_cap) {
                         int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                        while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                        while (new_cap < phys_len + chunk_tokens) new_cap *= 2;
                         float *tmp = (float *)realloc(s->adapter_buf,
                             (size_t)new_cap * dim * sizeof(float));
                         if (!tmp) { free(adapter_chunk); return; }
                         s->adapter_buf = tmp;
                         s->adapter_cap = new_cap;
                     }
-                    memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+                    memcpy(s->adapter_buf + (size_t)phys_len * dim,
                            adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
                     s->total_adapter += chunk_tokens;
                 }
@@ -978,17 +939,18 @@ static void stream_run_encoder(vox_stream_t *s) {
         free(combined);
 
         if (adapter_chunk && chunk_tokens > 0) {
-            /* Append to adapter buffer */
-            if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+            /* Append to adapter buffer (physical offsets account for compaction) */
+            int phys_len = s->total_adapter - s->adapter_pos_offset;
+            if (phys_len + chunk_tokens > s->adapter_cap) {
                 int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                while (new_cap < phys_len + chunk_tokens) new_cap *= 2;
                 float *tmp = (float *)realloc(s->adapter_buf,
                     (size_t)new_cap * dim * sizeof(float));
                 if (!tmp) { free(adapter_chunk); free(enc_out); return; }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
             }
-            memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+            memcpy(s->adapter_buf + (size_t)phys_len * dim,
                    adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
             s->total_adapter += chunk_tokens;
             free(adapter_chunk);
@@ -1113,7 +1075,8 @@ static void stream_run_decoder(vox_stream_t *s) {
             for (int i = 0; i < prompt_len; i++) {
                 int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
                 tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
-                const float *a = s->adapter_buf + (size_t)i * dim;
+                int phys_pos = i - s->adapter_pos_offset;
+                const float *a = s->adapter_buf + (size_t)phys_pos * dim;
                 float *dst = prompt_embeds + (size_t)i * dim;
                 for (int j = 0; j < dim; j++) dst[j] = a[j] + s->tok_tmp[j];
             }
@@ -1183,7 +1146,8 @@ static void stream_run_decoder(vox_stream_t *s) {
 #endif
             } else {
                 tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
-                const float *a = s->adapter_buf + (size_t)s->gen_pos * dim;
+                int phys_pos = s->gen_pos - s->adapter_pos_offset;
+                const float *a = s->adapter_buf + (size_t)phys_pos * dim;
                 for (int j = 0; j < dim; j++)
                     s->step_embed[j] = a[j] + s->tok_tmp[j];
 
@@ -1211,6 +1175,9 @@ static void stream_run_decoder(vox_stream_t *s) {
             s->decoder_ms += vox_get_time_ms() - t0;
         }
     }
+
+    /* Reclaim adapter buffer space for tokens the decoder has consumed */
+    stream_adapter_compact(s);
 }
 
 vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
