@@ -601,6 +601,25 @@ void vox_cuda_stream_adapter_reset(void) {
     g_stream_adapter_len = 0;
 }
 
+void vox_cuda_stream_adapter_compact(int discard, int keep) {
+    if (!vox_cuda_available()) return;
+    if (discard <= 0 || keep <= 0) return;
+    if (!g_stream_adapter || g_stream_adapter_len < (discard + keep)) return;
+
+    (void)cuCtxSetCurrent(g_ctx);
+    size_t dim = VOX_DEC_DIM;
+    size_t bytes_per_tok = dim * sizeof(float);
+    size_t keep_bytes = (size_t)keep * bytes_per_tok;
+    size_t src_off = (size_t)discard * bytes_per_tok;
+
+    CUresult r = cuMemcpyDtoDAsync(g_stream_adapter, g_stream_adapter + src_off, keep_bytes, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(stream_adapter_compact)", r); return; }
+    r = cuStreamSynchronize(g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("sync(stream_adapter_compact)", r); return; }
+
+    g_stream_adapter_len = keep;
+}
+
 int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens) {
     if (!vox_cuda_available()) return 0;
     if (!out_host || n_tokens <= 0) return 0;

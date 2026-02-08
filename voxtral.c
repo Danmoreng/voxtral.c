@@ -744,6 +744,14 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
     return result;
 }
 
+static int stream_strict_eos(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *env = getenv("VOX_STREAM_STRICT_EOS");
+    cached = (env && env[0] && env[0] != '0');
+    return cached;
+}
+
 /* Compact adapter buffer: discard tokens the decoder has already consumed */
 static void stream_adapter_compact(vox_stream_t *s) {
     if (!s->adapter_buf) return;
@@ -758,10 +766,16 @@ static void stream_adapter_compact(vox_stream_t *s) {
                 s->adapter_buf + (size_t)consumed * dim,
                 (size_t)remaining * dim * sizeof(float));
 
+#ifdef USE_CUDA
+    if (stream_use_cuda_pipeline_full()) {
+        vox_cuda_stream_adapter_compact(consumed, remaining);
+    }
+#endif
+
     s->adapter_pos_offset += consumed;
 }
 
-/* Return non-zero if we should use the CUDA full encoder+adapter path.
+/* Run encoder incrementally on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
     float *mel_data = vox_mel_data(s->mel_ctx, &total_mel);

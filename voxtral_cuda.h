@@ -86,6 +86,7 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
  * device, decoder consumes adapter embeddings directly). Opt-in via
  * VOX_CUDA_PIPELINE_FULL=1. */
 void vox_cuda_stream_adapter_reset(void);
+void vox_cuda_stream_adapter_compact(int discard, int keep);
 
 /* Copy the first `n_tokens` adapter embeddings from the device-side adapter
  * buffer into `out_host` (float32, shape [n_tokens, VOX_DEC_DIM]). Used to
