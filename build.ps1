@@ -106,7 +106,7 @@ if ($Cuda) {
         $CUDA_LIB_PATH = Join-Path $env:CUDA_PATH "lib\x64"
     } else {
         # Try default location
-        $CUDA_LIB_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\lib\x64" # Adjust version if needed logic
+        $CUDA_LIB_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\lib\x64" # Adjust version if needed logic
         if (-not (Test-Path $CUDA_LIB_PATH)) {
              Write-Warning "Could not guess CUDA lib path. Linking might fail."
         }
@@ -164,7 +164,8 @@ if ($CC -eq "gcc") {
     
     if ($Cuda) {
         Write-Host "Generating CUDA kernel header..."
-        powershell.exe -ExecutionPolicy Bypass -File scripts\gen_cuda_header.ps1
+        # Run in current session so MSVC environment is preserved
+        & (Join-Path $PSScriptRoot "scripts\gen_cuda_header.ps1")
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         
         $CFLAGS += "/DUSE_CUDA"

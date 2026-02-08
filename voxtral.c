@@ -498,16 +498,28 @@ struct vox_stream {
 #ifdef USE_CUDA
 /* VOX_CUDA_PIPELINE_FULL uses a global device-side adapter buffer, so it isn't
  * safe to run concurrently across multiple streams. Enforce single-stream use. */
+#ifdef _WIN32
+static volatile long g_cuda_pipeline_full_in_use = 0;
+#else
 static int g_cuda_pipeline_full_in_use = 0;
+#endif
 
 static int cuda_pipeline_full_acquire(void) {
+#ifdef _WIN32
+    return InterlockedCompareExchange(&g_cuda_pipeline_full_in_use, 1, 0) == 0;
+#else
     int expected = 0;
     return __atomic_compare_exchange_n(&g_cuda_pipeline_full_in_use, &expected, 1, 0,
                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+#endif
 }
 
 static void cuda_pipeline_full_release(void) {
+#ifdef _WIN32
+    InterlockedExchange(&g_cuda_pipeline_full_in_use, 0);
+#else
     __atomic_store_n(&g_cuda_pipeline_full_in_use, 0, __ATOMIC_SEQ_CST);
+#endif
 }
 #endif
 
