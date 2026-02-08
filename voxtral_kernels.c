@@ -4,14 +4,21 @@
  */
 
 #include "voxtral_kernels.h"
-#include "voxtral.h"
 #include <math.h>
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef USE_METAL
 #include "voxtral_metal.h"
+#endif
+
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
 #endif
 
 #ifdef USE_BLAS
@@ -22,161 +29,39 @@
 #endif
 #endif
 
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-#include <immintrin.h>
-#endif
-
-#ifdef USE_AVX512BF16
-#include "voxtral_avx512.h"
-/* Fast vectorized exp approximation for SiLU/GELU (AVX-512) */
-static inline __m512 exp512_ps(__m512 x) {
-    static const __m512 log2e = {1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
-                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
-                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
-                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f};
-    static const __m512 c1 = {0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f,
-                              0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f};
-    static const __m512 c2 = {-2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f,
-                              -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f};
-    static const __m512 p0 = {1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f,
-                              1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f};
-    static const __m512 p1 = {1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f,
-                              1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f};
-    static const __m512 p2 = {8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f,
-                              8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f};
-    static const __m512 p3 = {4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f,
-                              4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f};
-    static const __m512 p4 = {1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f,
-                              1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f};
-    static const __m512 p5 = {5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f,
-                              5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f};
-
-    __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT |_MM_FROUND_NO_EXC);
-    __m512 t = _mm512_fnmadd_ps(fx, c1, x);
-    t = _mm512_fnmadd_ps(fx, c2, t);
-    __m512 z = _mm512_mul_ps(t, t);
-    __m512 y = _mm512_fmadd_ps(p0, t, p1);
-    y = _mm512_fmadd_ps(y, t, p2);
-    y = _mm512_fmadd_ps(y, t, p3);
-    y = _mm512_fmadd_ps(y, t, p4);
-    y = _mm512_fmadd_ps(y, t, p5);
-    y = _mm512_add_ps(_mm512_fmadd_ps(y, z, t), _mm512_set1_ps(1.0f));
-
-    /* Build 2^n */
-    __m512i imm0 = _mm512_cvtps_epi32(fx);
-    imm0 = _mm512_add_epi32(imm0, _mm512_set1_epi32(127));
-    imm0 = _mm512_slli_epi32(imm0, 23);
-    __m512 pow2n = _mm512_castsi512_ps(imm0);
-
-    return _mm512_mul_ps(y, pow2n);
-}
-
-/* Cached runtime check: -1 = unchecked, 0 = unavailable, 1 = available */
-static int avx512bf16_detected = -1;
-static int avx512bf16_check(void) {
-    if (avx512bf16_detected == -1)
-        avx512bf16_detected = avx512bf16_available();
-    if (!avx512bf16_detected) {
-        fprintf(stderr, "FATAL: This binary was compiled with AVX-512 BF16 support,\n"
-                        "but this CPU does not support it.\n"
-                        "Required: AMD Zen 4+ or Intel Sapphire Rapids+.\n");
-        exit(1);
-    }
-    return 1;
-}
-#endif
-
-#ifdef USE_CUDA
-#include "voxtral_cuda.h"
-#endif
-
 /* Minimum matrix size to use GPU */
 #define MIN_GPU_ELEMENTS (512 * 512)
-
-extern vox_backend_t g_selected_backend;
 
 /* ========================================================================
  * Basic Element-wise Operations
  * ======================================================================== */
 
-void vox_add_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_add_inplace(ctx, a, b, n);
-        return;
-    }
+void vox_add_inplace(float *a, const float *b, int n) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n >= (1<<18))
 #endif
-    int i = 0;
-#if defined(USE_AVX512BF16)
-    for (; i <= n - 16; i += 16) {
-        _mm512_storeu_ps(a + i, _mm512_add_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
-    }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-    for (; i <= n - 8; i += 8) {
-        _mm256_storeu_ps(a + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
-    }
-#endif
-    for (; i < n; i++) a[i] += b[i];
+    for (int i = 0; i < n; i++) a[i] += b[i];
 }
 
-void vox_mul_inplace(vox_cuda_ctx_t *ctx, float *a, const float *b, int n) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_mul_inplace(ctx, a, b, n);
-        return;
-    }
+void vox_mul_inplace(float *a, const float *b, int n) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n >= (1<<18))
 #endif
-    int i = 0;
-#if defined(USE_AVX512BF16)
-    for (; i <= n - 16; i += 16) {
-        _mm512_storeu_ps(a + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
-    }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-    for (; i <= n - 8; i += 8) {
-        _mm256_storeu_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
-    }
-#endif
-    for (; i < n; i++) a[i] *= b[i];
+    for (int i = 0; i < n; i++) a[i] *= b[i];
 }
 
-void vox_axpy(vox_cuda_ctx_t *ctx, float *a, float scale, const float *b, int n) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_axpy(ctx, a, scale, b, n);
-        return;
-    }
+void vox_axpy(float *a, float scale, const float *b, int n) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n >= (1<<18))
 #endif
-    int i = 0;
-    /* TODO: CUDA axpy kernel */
-#if defined(USE_AVX512BF16)
-    __m512 s512 = _mm512_set1_ps(scale);
-    for (; i <= n - 16; i += 16) {
-        _mm512_storeu_ps(a + i, _mm512_fmadd_ps(s512, _mm512_loadu_ps(b + i), _mm512_loadu_ps(a + i)));
-    }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-    __m256 s = _mm256_set1_ps(scale);
-    for (; i <= n - 8; i += 8) {
-        _mm256_storeu_ps(a + i, _mm256_fmadd_ps(s, _mm256_loadu_ps(b + i), _mm256_loadu_ps(a + i)));
-    }
-#endif
-    for (; i < n; i++) a[i] += scale * b[i];
+    for (int i = 0; i < n; i++) a[i] += scale * b[i];
 }
 
 void vox_scale(float *x, float s, int n) {
-    /* TODO: CUDA scale kernel */
-    int i = 0;
-#if defined(USE_AVX512BF16)
-    __m512 s_vec512 = _mm512_set1_ps(s);
-    for (; i <= n - 16; i += 16) {
-        _mm512_storeu_ps(x + i, _mm512_mul_ps(_mm512_loadu_ps(x + i), s_vec512));
-    }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-    __m256 s_vec = _mm256_set1_ps(s);
-    for (; i <= n - 8; i += 8) {
-        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), s_vec));
-    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n >= (1<<18))
 #endif
-    for (; i < n; i++) x[i] *= s;
+    for (int i = 0; i < n; i++) x[i] *= s;
 }
 
 void vox_copy(float *dst, const float *src, int n) {
@@ -187,120 +72,79 @@ void vox_copy(float *dst, const float *src, int n) {
  * Matrix Operations
  * ======================================================================== */
 
-/* Block size for tiling - tuned for L1/L2 cache */
-#define BLOCK_M 64
-#define BLOCK_N 64
-#define BLOCK_K 64
-
-void vox_matmul(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, int M, int K, int N) {
+void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        /* cuBLAS handles large matrices efficiently */
-        vox_cuda_sgemm(ctx, M, N, K, A, B, C);
-        return;
+    static int logged_cuda = 0;
+    static int logged_fallback = 0;
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS) {
+        if (vox_cuda_matmul(C, A, B, M, K, N)) {
+            if (!logged_cuda && vox_verbose >= 2) {
+                fprintf(stderr, "[kernels] backend=CUDA (device=%s)\n", vox_cuda_device_name());
+                logged_cuda = 1;
+            }
+            return;
+        }
+        if (!logged_fallback && vox_verbose >= 2) {
+            fprintf(stderr, "[kernels] CUDA unavailable for matmul, falling back to CPU/BLAS\n");
+            logged_fallback = 1;
+        }
     }
 #endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
 #else
-    int m, n;
-    /* Initialize C to zero */
-    #pragma omp parallel for private(n)
-    for (m = 0; m < M; m++) {
-        for (n = 0; n < N; n++) {
-            C[m * N + n] = 0.0f;
-        }
-    }
-
-    /* Tiled matrix multiplication */
-    int m0, n0;
-    #pragma omp parallel for private(n0) schedule(dynamic)
-    for (m0 = 0; m0 < M; m0 += BLOCK_M) {
-        for (n0 = 0; n0 < N; n0 += BLOCK_N) {
-            int m_end = (m0 + BLOCK_M < M) ? m0 + BLOCK_M : M;
-            int n_end = (n0 + BLOCK_N < N) ? n0 + BLOCK_N : N;
-
-            for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-                int k_end = (k0 + BLOCK_K < K) ? k0 + BLOCK_K : K;
-
-                for (int m = m0; m < m_end; m++) {
-                    for (int k = k0; k < k_end; k++) {
-                        float a_val = A[m * K + k];
-                        for (int n = n0; n < n_end; n++) {
-                            C[m * N + n] += a_val * B[k * N + n];
-                        }
-                    }
-                }
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += A[m * K + k] * B[k * N + n];
             }
+            C[m * N + n] = sum;
         }
     }
 #endif
 }
 
-void vox_matmul_t(vox_cuda_ctx_t *ctx, float *C, const float *A, const float *B, int M, int K, int N) {
+void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_sgemm_t(ctx, M, N, K, A, B, C);
-        return;
+    static int logged_cuda_t = 0;
+    static int logged_fallback_t = 0;
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS) {
+        if (vox_cuda_matmul_t(C, A, B, M, K, N)) {
+            if (!logged_cuda_t && vox_verbose >= 2) {
+                fprintf(stderr, "[kernels] backend=CUDA transpose path\n");
+                logged_cuda_t = 1;
+            }
+            return;
+        }
+        if (!logged_fallback_t && vox_verbose >= 2) {
+            fprintf(stderr, "[kernels] CUDA unavailable for matmul_t, falling back to CPU/BLAS\n");
+            logged_fallback_t = 1;
+        }
     }
 #endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    int m, n;
-    /* Initialize C to zero */
-    #pragma omp parallel for private(n)
-    for (m = 0; m < M; m++) {
-        for (n = 0; n < N; n++) {
-            C[m * N + n] = 0.0f;
-        }
-    }
-
-    int m0, n0;
-    /* Tiled matrix multiplication (B is transposed: B[n][k]) */
-    #pragma omp parallel for private(n0) schedule(dynamic)
-    for (m0 = 0; m0 < M; m0 += BLOCK_M) {
-        for (n0 = 0; n0 < N; n0 += BLOCK_N) {
-            int m_end = (m0 + BLOCK_M < M) ? m0 + BLOCK_M : M;
-            int n_end = (n0 + BLOCK_N < N) ? n0 + BLOCK_N : N;
-            
-            /* Process all k blocks for this m,n block */
-            for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-                int k_end = (k0 + BLOCK_K < K) ? k0 + BLOCK_K : K;
-                
-                for (int m = m0; m < m_end; m++) {
-                    for (int n = n0; n < n_end; n++) {
-                        float sum = 0.0f;
-                        for (int k = k0; k < k_end; k++) {
-                            sum += A[m * K + k] * B[n * K + k];
-                        }
-                        C[m * N + n] += sum;
-                    }
-                }
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += A[m * K + k] * B[n * K + k];
             }
+            C[m * N + n] = sum;
         }
     }
 #endif
 }
 
-void vox_linear(vox_cuda_ctx_t *ctx, float *y, const float *x, const float *W, const float *b,
+void vox_linear(float *y, const float *x, const float *W, const float *b,
                 int seq_len, int in_dim, int out_dim) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_matmul_t(ctx, y, x, W, seq_len, in_dim, out_dim);
-        if (b != NULL) {
-            vox_cuda_bias_add(ctx, y, b, seq_len, out_dim);
-        }
-        return;
-    }
-#endif
-#ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                seq_len, out_dim, in_dim,
-                1.0f, x, in_dim, W, in_dim,
-                0.0f, y, out_dim);
+    /* Implement Linear in terms of matmul_t so CUDA path is available even
+     * when OpenBLAS isn't present (e.g. CUDA-only Linux builds). */
+    vox_matmul_t(y, x, W, seq_len, in_dim, out_dim);
     if (b != NULL) {
         for (int s = 0; s < seq_len; s++) {
             for (int o = 0; o < out_dim; o++) {
@@ -308,26 +152,11 @@ void vox_linear(vox_cuda_ctx_t *ctx, float *y, const float *x, const float *W, c
             }
         }
     }
-#else
-    int s, o, i;
-    #pragma omp parallel for private(o, i)
-    for (s = 0; s < seq_len; s++) {
-        for (o = 0; o < out_dim; o++) {
-            const float *x_row = x + s * in_dim;
-            const float *w_row = W + o * in_dim;
-            float sum = (b != NULL) ? b[o] : 0.0f;
-            for (i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
-            }
-            y[s * out_dim + o] = sum;
-        }
-    }
-#endif
 }
 
-void vox_linear_nobias(vox_cuda_ctx_t *ctx, float *y, const float *x, const float *W,
+void vox_linear_nobias(float *y, const float *x, const float *W,
                        int seq_len, int in_dim, int out_dim) {
-    vox_linear(ctx, y, x, W, NULL, seq_len, in_dim, out_dim);
+    vox_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
 /* Convert bf16 buffer to f32 buffer */
@@ -343,8 +172,8 @@ static size_t bf16_scratch_cap = 0;
 
 static float *bf16_get_scratch(size_t n) {
     if (n > bf16_scratch_cap) {
-        vox_mem_free(bf16_scratch);
-        bf16_scratch = (float *)vox_mem_malloc(n * sizeof(float));
+        free(bf16_scratch);
+        bf16_scratch = (float *)malloc(n * sizeof(float));
         bf16_scratch_cap = bf16_scratch ? n : 0;
     }
     return bf16_scratch;
@@ -363,36 +192,12 @@ static float *bf16_get_scratch(size_t n) {
 
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
-    int o;
-    #pragma omp parallel for private(o)
-    for (o = 0; o < out_dim; o++) {
+    for (int o = 0; o < out_dim; o++) {
         const uint16_t *w_row = W_bf16 + (size_t)o * in_dim;
         float sum = bias ? bias[o] : 0.0f;
         int k = 0;
 
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-        __m256 acc = _mm256_setzero_ps();
-        for (; k + 8 <= in_dim; k += 8) {
-            /* Load 8 bf16 weights (128 bits) */
-            __m128i bf = _mm_loadu_si128((const __m128i*)(w_row + k));
-            /* Expand to 8x32-bit ints */
-            __m256i w_int = _mm256_cvtepu16_epi32(bf);
-            /* Shift left by 16 to get f32 bit pattern */
-            w_int = _mm256_slli_epi32(w_int, 16);
-            /* Cast to float */
-            __m256 w_f32 = _mm256_castsi256_ps(w_int);
-            
-            /* Load 8 input floats */
-            __m256 x_vec = _mm256_loadu_ps(x + k);
-            
-            /* Fused multiply-add */
-            acc = _mm256_fmadd_ps(w_f32, x_vec, acc);
-        }
-        /* Horizontal sum */
-        float temp[8];
-        _mm256_storeu_ps(temp, acc);
-        for(int i=0; i<8; i++) sum += temp[i];
-#elif defined(__ARM_NEON)
+#ifdef __ARM_NEON
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
 
@@ -428,29 +233,20 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
     }
 }
 
-void vox_linear_nobias_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16_t *W_bf16,
+void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_matmul_bf16(ctx, seq_len, out_dim, in_dim, x, W_bf16, y, 1);
-        return;
-    }
-#endif
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
         return;
     }
 #endif
-#ifdef USE_AVX512BF16
-    if (seq_len > 1) {
-        avx512bf16_check();
-        matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
-        return;
-    } else if (seq_len == 1) {
-        avx512bf16_check();
-        matvec_avx512bf16(y, x, W_bf16, out_dim, in_dim);
-        return;
+#ifdef USE_CUDA
+    /* Decoder hot path uses seq_len=1. On x86 this CPU matvec is very slow, so
+     * prefer cuBLAS BF16 GEMM for sufficiently large weights. */
+    size_t elems = (size_t)in_dim * (size_t)out_dim;
+    if (elems >= (size_t)256 * 1024) {
+        if (vox_cuda_matmul_t_bf16(y, x, W_bf16, seq_len, in_dim, out_dim)) return;
     }
 #endif
     if (seq_len == 1) {
@@ -461,20 +257,12 @@ void vox_linear_nobias_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
     bf16_to_f32_buf(W_f32, W_bf16, n);
-    vox_linear_nobias(ctx, y, x, W_f32, seq_len, in_dim, out_dim);
+    /* Route through matmul_t to take CUDA path for large matrices. */
+    vox_matmul_t(y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
-void vox_linear_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16_t *W_bf16,
+void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                      const float *b, int seq_len, int in_dim, int out_dim) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_matmul_bf16(ctx, seq_len, out_dim, in_dim, x, W_bf16, y, 1);
-        if (b != NULL) {
-            vox_cuda_bias_add(ctx, y, b, seq_len, out_dim);
-        }
-        return;
-    }
-#endif
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
@@ -488,25 +276,10 @@ void vox_linear_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16
         return;
     }
 #endif
-#ifdef USE_AVX512BF16
-    if (seq_len > 1) {
-        avx512bf16_check();
-        matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
-        if (b != NULL) {
-            for (int s = 0; s < seq_len; s++) {
-                for (int o = 0; o < out_dim; o++) {
-                    y[s * out_dim + o] += b[o];
-                }
-            }
-        }
-        return;
-    } else if (seq_len == 1) {
-        avx512bf16_check();
-        matvec_avx512bf16(y, x, W_bf16, out_dim, in_dim);
-        if (b != NULL) {
-            for (int o = 0; o < out_dim; o++) y[o] += b[o];
-        }
-        return;
+#ifdef USE_CUDA
+    size_t elems = (size_t)in_dim * (size_t)out_dim;
+    if (elems >= (size_t)256 * 1024) {
+        if (vox_cuda_linear_bf16(y, x, W_bf16, b, seq_len, in_dim, out_dim)) return;
     }
 #endif
     if (seq_len == 1) {
@@ -517,17 +290,11 @@ void vox_linear_bf16(vox_cuda_ctx_t *ctx, float *y, const float *x, const uint16
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
     bf16_to_f32_buf(W_f32, W_bf16, n);
-    vox_linear(ctx, y, x, W_f32, b, seq_len, in_dim, out_dim);
+    vox_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
 }
 
-void vox_matmul_t_bf16(vox_cuda_ctx_t *ctx, float *C, const float *A, const uint16_t *B_bf16,
+void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_matmul_bf16(ctx, M, N, K, A, B_bf16, C, 1);
-        return;
-    }
-#endif
     /*
      * C[M,N] = A[M,K] @ B[N,K]^T
      * For M=1: use fused BF16 matvec (no intermediate buffer needed).
@@ -539,15 +306,10 @@ void vox_matmul_t_bf16(vox_cuda_ctx_t *ctx, float *C, const float *A, const uint
         return;
     }
 #endif
-#ifdef USE_AVX512BF16
-    if (M > 1) {
-        avx512bf16_check();
-        matmul_avx512bf16_tiled(C, A, B_bf16, M, N, K);
-        return;
-    } else if (M == 1) {
-        avx512bf16_check();
-        matvec_avx512bf16(C, A, B_bf16, N, K);
-        return;
+#ifdef USE_CUDA
+    size_t elems = (size_t)K * (size_t)N;
+    if (elems >= (size_t)256 * 1024) {
+        if (vox_cuda_matmul_t_bf16(C, A, B_bf16, M, K, N)) return;
     }
 #endif
     if (M == 1) {
@@ -557,7 +319,7 @@ void vox_matmul_t_bf16(vox_cuda_ctx_t *ctx, float *C, const float *A, const uint
         float *B_f32 = bf16_get_scratch(n);
         if (!B_f32) return;
         bf16_to_f32_buf(B_f32, B_bf16, n);
-        vox_matmul_t(ctx, C, A, B_f32, M, K, N);
+        vox_matmul_t(C, A, B_f32, M, K, N);
     }
 }
 
@@ -565,10 +327,9 @@ void vox_matmul_t_bf16(vox_cuda_ctx_t *ctx, float *C, const float *A, const uint
  * 1D Convolution
  * ======================================================================== */
 
-void vox_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *weight, const float *bias,
+void vox_conv1d(float *out, const float *in, const float *weight, const float *bias,
                 int channels_in, int channels_out, int length,
                 int kernel_size, int stride, int padding) {
-    (void)ctx;
     int out_length = (length + 2 * padding - kernel_size) / stride + 1;
 
     for (int oc = 0; oc < channels_out; oc++) {
@@ -589,28 +350,22 @@ void vox_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *w
     }
 }
 
-void vox_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const float *weight, const float *bias,
+void vox_causal_conv1d(float *out, const float *in, const float *weight, const float *bias,
                        int channels_in, int channels_out, int length,
                        int kernel_size, int stride) {
     /* Matches vLLM WhisperCausalConv1d padding scheme.
-     * Uses im2col + BLAS sgemm for fast computation. */
+     * Uses im2col + matmul (CUDA/BLAS when available) for fast computation. */
     int padding_total = kernel_size - stride;
     float n_frames = ((float)length - kernel_size + padding_total) / (float)stride + 1.0f;
     int out_length = (int)ceilf(n_frames);
     if (out_length <= 0) return;
 
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_causal_conv1d(ctx, out, in, weight, bias, channels_in, channels_out, length, out_length, kernel_size, stride);
-        return;
-    }
-#endif
     int left_pad = padding_total;
     int K = channels_in * kernel_size;
 
     /* Build im2col matrix: [K, out_length] row-major.
      * im2col[ic*kernel_size + k, ol] = in[ic, ol*stride - left_pad + k] (0 if OOB) */
-    float *im2col = (float *)vox_mem_calloc((size_t)K * out_length, sizeof(float));
+    float *im2col = (float *)calloc((size_t)K * out_length, sizeof(float));
     for (int ol = 0; ol < out_length; ol++) {
         for (int ic = 0; ic < channels_in; ic++) {
             for (int k = 0; k < kernel_size; k++) {
@@ -623,20 +378,9 @@ void vox_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const f
         }
     }
 
-    /* out = weight +� im2col: [channels_out, K] +� [K, out_length] ��� [channels_out, out_length] */
-#ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                channels_out, out_length, K,
-                1.0f,
-                weight, K,
-                im2col, out_length,
-                0.0f,
-                out, out_length);
-#else
-    /* Use vox_matmul (which handles AVX2/AVX512/OpenMP) instead of raw loop */
-    vox_matmul(ctx, out, weight, im2col, channels_out, K, out_length);
-#endif
-    vox_mem_free(im2col);
+    /* out = weight × im2col: [channels_out, K] × [K, out_length] → [channels_out, out_length] */
+    vox_matmul(out, weight, im2col, channels_out, K, out_length);
+    free(im2col);
 
     /* Add bias */
     if (bias) {
@@ -653,62 +397,23 @@ void vox_causal_conv1d(vox_cuda_ctx_t *ctx, float *out, const float *in, const f
  * Normalization
  * ======================================================================== */
 
-void vox_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const float *weight,
+void vox_rms_norm(float *out, const float *x, const float *weight,
                   int seq_len, int hidden, float eps) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_rms_norm(ctx, out, x, weight, seq_len, hidden, eps);
-        return;
-    }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if ((long long)seq_len * hidden >= (1LL<<20))
 #endif
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
 
         float sum_sq = 0.0f;
-        int i = 0;
-
-#if defined(USE_AVX512BF16)
-        __m512 v_sum_sq512 = _mm512_setzero_ps();
-        for (; i <= hidden - 16; i += 16) {
-            __m512 v_x = _mm512_loadu_ps(x_row + i);
-            v_sum_sq512 = _mm512_fmadd_ps(v_x, v_x, v_sum_sq512);
-        }
-        sum_sq = _mm512_reduce_add_ps(v_sum_sq512);
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-        __m256 v_sum_sq = _mm256_setzero_ps();
-        for (; i <= hidden - 8; i += 8) {
-            __m256 v_x = _mm256_loadu_ps(x_row + i);
-            v_sum_sq = _mm256_fmadd_ps(v_x, v_x, v_sum_sq);
-        }
-        float temp[8];
-        _mm256_storeu_ps(temp, v_sum_sq);
-        for (int j = 0; j < 8; j++) sum_sq += temp[j];
-#endif
-        for (; i < hidden; i++) {
+        for (int i = 0; i < hidden; i++) {
             sum_sq += x_row[i] * x_row[i];
         }
-
         float rms = sqrtf(sum_sq / hidden + eps);
         float rms_inv = 1.0f / rms;
 
-        i = 0;
-#if defined(USE_AVX512BF16)
-        __m512 v_rms_inv512 = _mm512_set1_ps(rms_inv);
-        for (; i <= hidden - 16; i += 16) {
-            __m512 v_x = _mm512_loadu_ps(x_row + i);
-            __m512 v_w = _mm512_loadu_ps(weight + i);
-            _mm512_storeu_ps(out_row + i, _mm512_mul_ps(_mm512_mul_ps(v_x, v_rms_inv512), v_w));
-        }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-        __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
-        for (; i <= hidden - 8; i += 8) {
-            __m256 v_x = _mm256_loadu_ps(x_row + i);
-            __m256 v_w = _mm256_loadu_ps(weight + i);
-            _mm256_storeu_ps(out_row + i, _mm256_mul_ps(_mm256_mul_ps(v_x, v_rms_inv), v_w));
-        }
-#endif
-        for (; i < hidden; i++) {
+        for (int i = 0; i < hidden; i++) {
             out_row[i] = x_row[i] * rms_inv * weight[i];
         }
     }
@@ -718,119 +423,23 @@ void vox_rms_norm(vox_cuda_ctx_t *ctx, float *out, const float *x, const float *
  * Activation Functions
  * ======================================================================== */
 
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-/* Fast vectorized exp approximation for SiLU/GELU */
-static inline __m256 exp256_ps(__m256 x) {
-    /* exp(x) = 2^(x * log2(e)) */
-    static const __m256 log2e = {1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f,
-                                 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f, 1.4426950408889634074f};
-    static const __m256 c1 = {0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f, 0.693359375f};
-    static const __m256 c2 = {-2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f, -2.12194440e-4f};
-    static const __m256 p0 = {1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f, 1.9875691500e-4f};
-    static const __m256 p1 = {1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f, 1.3981999507e-3f};
-    static const __m256 p2 = {8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f, 8.3334519073e-3f};
-    static const __m256 p3 = {4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f, 4.1665795894e-2f};
-    static const __m256 p4 = {1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f, 1.6666665459e-1f};
-    static const __m256 p5 = {5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f, 5.0000001201e-1f};
-
-    __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT |_MM_FROUND_NO_EXC);
-    __m256 t = _mm256_fnmadd_ps(fx, c1, x);
-    t = _mm256_fnmadd_ps(fx, c2, t);
-    __m256 z = _mm256_mul_ps(t, t);
-    __m256 y = _mm256_fmadd_ps(p0, t, p1);
-    y = _mm256_fmadd_ps(y, t, p2);
-    y = _mm256_fmadd_ps(y, t, p3);
-    y = _mm256_fmadd_ps(y, t, p4);
-    y = _mm256_fmadd_ps(y, t, p5);
-    y = _mm256_add_ps(_mm256_fmadd_ps(y, z, t), _mm256_set1_ps(1.0f));
-
-    /* Build 2^n */
-    __m256i imm0 = _mm256_cvtps_epi32(fx);
-    imm0 = _mm256_add_epi32(imm0, _mm256_set1_epi32(127));
-    imm0 = _mm256_slli_epi32(imm0, 23);
-    __m256 pow2n = _mm256_castsi256_ps(imm0);
-
-    return _mm256_mul_ps(y, pow2n);
-}
+void vox_silu(float *x, int n) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n >= (1<<19))
 #endif
-
-void vox_silu(vox_cuda_ctx_t *ctx, float *x, int n) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_silu(ctx, x, n);
-        return;
-    }
-#endif
-    int i = 0;
-#if defined(USE_AVX512BF16)
-    __m512 one512 = _mm512_set1_ps(1.0f);
-    for (; i <= n - 16; i += 16) {
-        __m512 vx = _mm512_loadu_ps(x + i);
-        __m512 vexp = exp512_ps(_mm512_sub_ps(_mm512_setzero_ps(), vx));
-        __m512 res = _mm512_div_ps(vx, _mm512_add_ps(one512, vexp));
-        _mm512_storeu_ps(x + i, res);
-    }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-    __m256 one = _mm256_set1_ps(1.0f);
-    for (; i <= n - 8; i += 8) {
-        __m256 vx = _mm256_loadu_ps(x + i);
-        __m256 vexp = exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), vx));
-        __m256 res = _mm256_div_ps(vx, _mm256_add_ps(one, vexp));
-        _mm256_storeu_ps(x + i, res);
-    }
-#endif
-    for (; i < n; i++) {
+    for (int i = 0; i < n; i++) {
         float val = x[i];
         x[i] = val / (1.0f + expf(-val));
     }
 }
 
-void vox_gelu(vox_cuda_ctx_t *ctx, float *x, int n) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_gelu(ctx, x, n);
-        return;
-    }
+void vox_gelu(float *x, int n) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n >= (1<<19))
 #endif
-    int i = 0;
-#if defined(USE_AVX512BF16)
-    __m512 half512 = _mm512_set1_ps(0.5f);
-    __m512 one512 = _mm512_set1_ps(1.0f);
-    __m512 k0_512 = _mm512_set1_ps(0.7978845608f);
-    __m512 k1_512 = _mm512_set1_ps(0.044715f);
-    __m512 two512 = _mm512_set1_ps(2.0f);
-
-    for (; i <= n - 16; i += 16) {
-        __m512 vx = _mm512_loadu_ps(x + i);
-        __m512 x3 = _mm512_mul_ps(_mm512_mul_ps(vx, vx), vx);
-        __m512 inner = _mm512_mul_ps(k0_512, _mm512_fmadd_ps(k1_512, x3, vx));
-        __m512 e2x = exp512_ps(_mm512_mul_ps(two512, inner));
-        __m512 vtanh = _mm512_div_ps(_mm512_sub_ps(e2x, one512), _mm512_add_ps(e2x, one512));
-        __m512 res = _mm512_mul_ps(half512, _mm512_mul_ps(vx, _mm512_add_ps(one512, vtanh)));
-        _mm512_storeu_ps(x + i, res);
-    }
-#elif defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
-    /* GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
-    __m256 half = _mm256_set1_ps(0.5f);
-    __m256 one = _mm256_set1_ps(1.0f);
-    __m256 k0 = _mm256_set1_ps(0.7978845608f); /* sqrt(2/pi) */
-    __m256 k1 = _mm256_set1_ps(0.044715f);
-
-    for (; i <= n - 8; i += 8) {
-        __m256 vx = _mm256_loadu_ps(x + i);
-        __m256 x3 = _mm256_mul_ps(_mm256_mul_ps(vx, vx), vx);
-        __m256 inner = _mm256_mul_ps(k0, _mm256_fmadd_ps(k1, x3, vx));
-        
-        /* tanh(x) approx using exp: (exp(2x) - 1) / (exp(2x) + 1) */
-        __m256 e2x = exp256_ps(_mm256_mul_ps(_mm256_set1_ps(2.0f), inner));
-        __m256 vtanh = _mm256_div_ps(_mm256_sub_ps(e2x, one), _mm256_add_ps(e2x, one));
-        
-        __m256 res = _mm256_mul_ps(half, _mm256_mul_ps(vx, _mm256_add_ps(one, vtanh)));
-        _mm256_storeu_ps(x + i, res);
-    }
-#endif
-    for (; i < n; i++) {
+    for (int i = 0; i < n; i++) {
         float val = x[i];
+        /* GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
         float x3 = val * val * val;
         float inner = 0.7978845608028654f * (val + 0.044715f * x3);
         x[i] = 0.5f * val * (1.0f + tanhf(inner));
@@ -863,24 +472,29 @@ void vox_softmax(float *x, int rows, int cols) {
  * Attention Operations
  * ======================================================================== */
 
-void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const float *K, const float *V,
+void vox_causal_attention(float *out, const float *Q, const float *K, const float *V,
                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
                           int head_dim, float scale, int window_size,
                           int q_offset) {
 #ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        if (vox_cuda_causal_attention(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads, head_dim, scale, window_size, q_offset))
+    /* GPU offload for large attention workloads (encoder hot path).
+     * Keep thresholds conservative to avoid overhead on tiny decode/prefill shapes. */
+    if (seq_q >= 128 && seq_k >= 128 && head_dim <= 128 && n_heads <= 32) {
+        if (vox_cuda_causal_attention(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads,
+                                      head_dim, scale, window_size, q_offset)) {
             return;
+        }
     }
 #endif
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
-    /* Process each query head in parallel */
-    int h;
-    #pragma omp parallel for private(h)
-    for (h = 0; h < n_heads; h++) {
+    /* Process each query head */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n_heads >= 8)
+#endif
+    for (int h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_kv;  /* GQA: map query head to KV head */
 
         for (int i = 0; i < seq_q; i++) {
@@ -947,13 +561,7 @@ void vox_causal_attention(vox_cuda_ctx_t *ctx, float *out, const float *Q, const
  * Rotary Position Embeddings
  * ======================================================================== */
 
-void vox_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, int seq, int dim, float theta) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_compute_rope_freqs(ctx, freqs, pos, seq, dim, theta);
-        return;
-    }
-#endif
+void vox_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
     int half_dim = dim / 2;
 
     for (int s = 0; s < seq; s++) {
@@ -967,13 +575,7 @@ void vox_compute_rope_freqs(vox_cuda_ctx_t *ctx, float *freqs, const int *pos, i
     }
 }
 
-void vox_apply_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, int heads, int head_dim) {
-#ifdef USE_CUDA
-    if (g_selected_backend == VOX_BACKEND_CUDA) {
-        vox_cuda_rope(ctx, x, freqs, seq, heads, head_dim);
-        return;
-    }
-#endif
+void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_dim) {
     /* x: [seq, heads * head_dim]
      * freqs: [seq, head_dim/2, 2] (cos, sin pairs)
      * Apply rotary embedding to consecutive pairs */
@@ -981,13 +583,14 @@ void vox_apply_rope(vox_cuda_ctx_t *ctx, float *x, const float *freqs, int seq, 
     int half_dim = head_dim / 2;
     int hidden = heads * head_dim;
 
-    int s, h, d;
-    #pragma omp parallel for private(h, d)
-    for (s = 0; s < seq; s++) {
-        for (h = 0; h < heads; h++) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if ((long long)seq * heads >= 256)
+#endif
+    for (int s = 0; s < seq; s++) {
+        for (int h = 0; h < heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-            for (d = 0; d < half_dim; d++) {
+            for (int d = 0; d < half_dim; d++) {
                 float cos_val = freqs[s * half_dim * 2 + d * 2];
                 float sin_val = freqs[s * half_dim * 2 + d * 2 + 1];
 
