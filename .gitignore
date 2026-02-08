@@ -10,7 +10,5 @@ misc/
 *.o
 *.obj
 *.exe
-*.pdb
-*.ilk
-.vs/
+*.wav
 build_log*.txt
