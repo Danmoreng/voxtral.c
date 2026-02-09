@@ -11,6 +11,27 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Windows/POSIX Portability */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#define strcasecmp _stricmp
+#define strdup _strdup
+#define close _close
+#define read _read
+#define open _open
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#include <strings.h>
+#endif
+
+double vox_get_time_ms(void);
+
 /* ========================================================================
  * Model Constants
  * ======================================================================== */
@@ -164,6 +185,7 @@ typedef struct {
     float *kv_cache_k;       /* [layers, max_seq, kv_heads * head_dim] */
     float *kv_cache_v;       /* [layers, max_seq, kv_heads * head_dim] */
     int kv_cache_len;        /* Current physical cache length */
+    int kv_cache_host_valid_len; /* Host KV cache prefix that is valid. CUDA-full keeps KV on-device and may leave host stale. */
     int kv_cache_max;        /* Maximum cache size */
     int kv_pos_offset;       /* Logical position offset (positions discarded by compaction) */
 
@@ -198,6 +220,7 @@ typedef struct {
     float *dec_attn_out, *dec_proj_out;
     float *dec_gate, *dec_up, *dec_ffn_out;
     float *dec_rope_freqs;
+    float *dec_logits; /* Optional: only used if caller passes logits=NULL */
 } vox_ctx_t;
 
 /* ========================================================================
@@ -271,6 +294,10 @@ int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
  * Default: 2.0. First chunk always waits for ~3s (decoder prompt needs 312 mel).
  * finish() always processes all remaining data regardless. */
 void vox_set_processing_interval(vox_stream_t *s, float seconds);
+
+/* Force the encoder to process whatever audio is buffered, regardless of the
+ * processing interval. Useful for flushing on silence detection. */
+int vox_stream_flush(vox_stream_t *s);
 
 /* Free streaming context and all resources. */
 void vox_stream_free(vox_stream_t *s);

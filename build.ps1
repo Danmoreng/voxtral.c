@@ -3,7 +3,8 @@ param(
     [switch]$Clean,
     [switch]$Blas,
     [switch]$Debug,
-    [switch]$Avx512
+    [switch]$Avx512,
+    [switch]$Cuda
 )
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,11 @@ function Import-VSEnv {
 # ---------------------------------------------------------------------------
 
 $SRCS = "voxtral.c", "voxtral_kernels.c", "voxtral_audio.c", "voxtral_encoder.c", "voxtral_decoder.c", "voxtral_tokenizer.c", "voxtral_safetensors.c", "main.c"
+if ($true) { # Since build.ps1 is only for Windows
+    $SRCS += "voxtral_mic_win32.c"
+} else {
+    $SRCS += "voxtral_mic_macos.c"
+}
 $TARGET = "voxtral.exe"
 
 if ($Clean) {
@@ -58,6 +64,7 @@ if ($Clean) {
     if (Test-Path $TARGET) { Remove-Item $TARGET }
     Get-ChildItem -Filter *.o | Remove-Item
     Get-ChildItem -Filter *.obj | Remove-Item
+    if (Test-Path "voxtral_cuda_kernels_cubin.h") { Remove-Item "voxtral_cuda_kernels_cubin.h" }
 }
 
 # Try to find a compiler
@@ -82,6 +89,36 @@ if (-not $CC) {
 
 Write-Host "Using compiler: $CC"
 
+# Helper for CUDA detection
+$NVCC = ""
+$CUDA_LIB_PATH = ""
+if ($Cuda) {
+    if (Test-Command nvcc) {
+        $NVCC = "nvcc"
+    } elseif ($env:CUDA_PATH) {
+        $nvccPath = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
+        if (Test-Path $nvccPath) {
+            $NVCC = $nvccPath
+        }
+    }
+    
+    if (-not $NVCC) {
+        Write-Error "CUDA requested but nvcc not found. Please install CUDA Toolkit."
+        exit 1
+    }
+    
+    if ($env:CUDA_PATH) {
+        $CUDA_LIB_PATH = Join-Path $env:CUDA_PATH "lib\x64"
+    } else {
+        # Try default location
+        $CUDA_LIB_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\lib\x64" # Adjust version if needed logic
+        if (-not (Test-Path $CUDA_LIB_PATH)) {
+             Write-Warning "Could not guess CUDA lib path. Linking might fail."
+        }
+    }
+    Write-Host "Using NVCC: $NVCC"
+}
+
 if ($CC -eq "gcc") {
     $CFLAGS = "-Wall", "-Wextra", "-O3", "-march=native", "-ffast-math", "-mavx2", "-mfma"
     $LDFLAGS = "-lm"
@@ -95,26 +132,59 @@ if ($CC -eq "gcc") {
         $CFLAGS += "-DUSE_BLAS", "-DUSE_OPENBLAS"
         $LDFLAGS += "-lopenblas"
     }
+    if ($Cuda) {
+        Write-Host "Generating CUDA kernel header..."
+        powershell.exe -ExecutionPolicy Bypass -File scripts\gen_cuda_header.ps1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        $CFLAGS += "-DUSE_CUDA"
+        $SRCS += "voxtral_cuda.c"
+        if ($env:CUDA_PATH) {
+            $CUDA_INC_PATH = Join-Path $env:CUDA_PATH "include"
+            $CFLAGS += "-I`"$CUDA_INC_PATH`""
+        }
+        $LDFLAGS += "-L`"$CUDA_LIB_PATH`"", "-lcuda", "-lcublas", "-lcublasLt"
+    } else {
+        $SRCS += "voxtral_cuda_stub.c"
+    }
     $cmd = "$CC $CFLAGS -o $TARGET $SRCS $LDFLAGS"
 } else {
     # MSVC (cl.exe)
-    # /O2: Optimization, /W3: Warning level, /MT: Static CRT, /D_CRT_SECURE_NO_WARNINGS, /openmp: Enable OpenMP, /arch:AVX2: Enable AVX2
     $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
+    $LINK_FLAGS = "ole32.lib uuid.lib mmdevapi.lib"
+    
     if ($Debug) {
         $CFLAGS = "/Zi", "/Od", "/DDEBUG", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX2"
+        $LINK_FLAGS += "/DEBUG"
     }
+    
     if ($Avx512) {
-        # Note: /arch:AVX512 is available in VS 2017 15.3+
         $CFLAGS = "/O2", "/W3", "/MT", "/D_CRT_SECURE_NO_WARNINGS", "/openmp", "/arch:AVX512", "/DUSE_AVX512BF16"
     }
+    
     if ($Blas) {
         $CFLAGS += "/DUSE_BLAS", "/DUSE_OPENBLAS"
-        Write-Warning "BLAS support with MSVC in this script is experimental (expects openblas.lib in search path)."
-        $LDFLAGS = "openblas.lib"
-    } else {
-        $LDFLAGS = ""
+        $LINK_FLAGS += " openblas.lib"
     }
-    $cmd = "$CC $CFLAGS $SRCS /Fe$TARGET /link $LDFLAGS"
+    
+    if ($Cuda) {
+        Write-Host "Generating CUDA kernel header..."
+        # Run in current session so MSVC environment is preserved
+        & (Join-Path $PSScriptRoot "scripts\gen_cuda_header.ps1")
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        
+        $CFLAGS += "/DUSE_CUDA"
+        if ($env:CUDA_PATH) {
+            $CUDA_INC_PATH = Join-Path $env:CUDA_PATH "include"
+            $CFLAGS += "/I`"$CUDA_INC_PATH`""
+        }
+        $SRCS += "voxtral_cuda.c"
+        $LINK_FLAGS += " /LIBPATH:`"$CUDA_LIB_PATH`" cuda.lib cudart.lib cublas.lib cublaslt.lib"
+    } else {
+        $SRCS += "voxtral_cuda_stub.c"
+    }
+
+    $cmd = "$CC $CFLAGS $SRCS /Fe$TARGET /link $LINK_FLAGS"
 }
 
 Write-Host "Building $TARGET..."

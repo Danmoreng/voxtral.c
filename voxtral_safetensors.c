@@ -4,15 +4,19 @@
  */
 
 #include "voxtral_safetensors.h"
+#include "voxtral.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <io.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #define open _open
 #define close _close
@@ -24,7 +28,6 @@
 #else
 #include <unistd.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #endif
 
 /* Minimal JSON parser for safetensors header */
@@ -223,8 +226,13 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_fstat64(fd, &st) < 0) {
+#else
     struct stat st;
     if (fstat(fd, &st) < 0) {
+#endif
         perror("safetensors_open: fstat failed");
         close(fd);
         return NULL;
@@ -240,28 +248,27 @@ safetensors_file_t *safetensors_open(const char *path) {
     void *data = NULL;
 #ifdef _WIN32
     HANDLE hFile = (HANDLE)_get_osfhandle(fd);
-    HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (hMapping == NULL) {
-        perror("safetensors_open: CreateFileMapping failed");
+    HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) {
+        fprintf(stderr, "safetensors_open: CreateFileMapping failed (error %lu)\n", GetLastError());
         close(fd);
         return NULL;
     }
-    data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-    CloseHandle(hMapping); /* MapViewOfFile keeps a reference */
-    if (data == NULL) {
-        perror("safetensors_open: MapViewOfFile failed");
-        close(fd);
+    data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    close(fd);
+    if (!data) {
+        fprintf(stderr, "safetensors_open: MapViewOfFile failed (error %lu)\n", GetLastError());
         return NULL;
     }
 #else
     data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-#endif
     close(fd);
-
     if (data == MAP_FAILED) {
         perror("safetensors_open: mmap failed");
         return NULL;
     }
+#endif
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;

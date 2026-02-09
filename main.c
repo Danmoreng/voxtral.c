@@ -7,12 +7,23 @@
 #include "voxtral.h"
 #include "voxtral_kernels.h"
 #include "voxtral_audio.h"
+#include "voxtral_mic.h"
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <math.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -21,19 +32,24 @@
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
+/* SIGINT handler for clean exit from --from-mic */
+static volatile sig_atomic_t mic_interrupted = 0;
+static void sigint_handler(int sig) { (void)sig; mic_interrupted = 1; }
+
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
-    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin) [options]\n\n", prog);
+    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin | --from-mic) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
-    fprintf(stderr, "  -d <dir>    Model directory (with consolidated.safetensors, tekken.json)\n");
-    fprintf(stderr, "  -i <file>   Input WAV file (16-bit PCM, any sample rate)\n");
-    fprintf(stderr, "  --stdin     Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
+    fprintf(stderr, "  -d <dir>      Model directory (with consolidated.safetensors, tekken.json)\n");
+    fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
+    fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
+    fprintf(stderr, "  --from-mic    Capture from default microphone (macOS only, Ctrl+C to stop)\n");
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -I <secs>   Encoder processing interval in seconds (default: 2.0)\n");
-    fprintf(stderr, "  --alt <c>   Show alternative tokens within cutoff distance (0.0-1.0)\n");
-    fprintf(stderr, "  --debug     Debug output (per-layer, per-chunk details)\n");
-    fprintf(stderr, "  --silent    No status output (only transcription on stdout)\n");
-    fprintf(stderr, "  -h          Show this help\n");
+    fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
+    fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
+    fprintf(stderr, "  --debug       Debug output (per-layer, per-chunk details)\n");
+    fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
+    fprintf(stderr, "  -h            Show this help\n");
 }
 
 /* Drain pending tokens from stream and print to stdout */
@@ -115,11 +131,14 @@ static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples)
 int main(int argc, char **argv) {
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
 #endif
     const char *model_dir = NULL;
     const char *input_wav = NULL;
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
+    int use_mic = 0;
     float interval = -1.0f; /* <0 means use default */
 
     for (int i = 1; i < argc; i++) {
@@ -141,6 +160,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
+        } else if (strcmp(argv[i], "--from-mic") == 0) {
+            use_mic = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -155,12 +176,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_dir || (!input_wav && !use_stdin)) {
+    if (!model_dir || (!input_wav && !use_stdin && !use_mic)) {
         usage(argv[0]);
         return 1;
     }
-    if (input_wav && use_stdin) {
-        fprintf(stderr, "Error: -i and --stdin are mutually exclusive\n");
+    if ((input_wav ? 1 : 0) + use_stdin + use_mic > 1) {
+        fprintf(stderr, "Error: -i, --stdin, and --from-mic are mutually exclusive\n");
         return 1;
     }
 
@@ -171,11 +192,19 @@ int main(int argc, char **argv) {
     vox_metal_init();
 #endif
 
+    const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
+    int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
+
     /* Load model */
+    double t0_load = vox_get_time_ms();
     vox_ctx_t *ctx = vox_load(model_dir);
+    double load_ms = vox_get_time_ms() - t0_load;
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);
         return 1;
+    }
+    if (force_timing) {
+        fprintf(stderr, "Model load: %.0f ms\n", load_ms);
     }
 
     vox_stream_t *s = vox_stream_init(ctx);
@@ -191,9 +220,122 @@ int main(int argc, char **argv) {
         feed_chunk = (int)(interval * VOX_SAMPLE_RATE);
         if (feed_chunk < 160) feed_chunk = 160;
         if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
+    } else if (use_mic) {
+        /* Default for mic: 0.5s updates for better responsiveness */
+        vox_set_processing_interval(s, 0.5f);
+        feed_chunk = 8000;
     }
 
-    if (use_stdin) {
+    double t0_run_ms = 0;
+    if (!use_mic) t0_run_ms = vox_get_time_ms();
+
+    if (use_mic) {
+        /* Microphone capture with silence cancellation */
+        if (vox_mic_start() != 0) {
+            vox_stream_free(s);
+            vox_free(ctx);
+            return 1;
+        }
+
+        /* Install SIGINT handler for clean Ctrl+C exit */
+#ifdef _WIN32
+        signal(SIGINT, sigint_handler);
+#else
+        struct sigaction sa;
+        sa.sa_handler = sigint_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+#endif
+
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Listening (Ctrl+C to stop)...\n");
+
+        /* Silence cancellation state */
+        #define MIC_WINDOW 160          /* 10ms at 16kHz */
+        #define SILENCE_THRESH 0.002f   /* RMS threshold (~-54 dBFS) */
+        #define SILENCE_PASS 60         /* pass-through windows (600ms) */
+        float mic_buf[4800]; /* 300ms max read */
+        int silence_count = 0;
+        int was_skipping = 0; /* were we skipping silence? */
+        int overbuf_warned = 0;
+
+        while (!mic_interrupted) {
+            /* Over-buffer detection */
+            int avail = vox_mic_read_available();
+            if (avail > 160000) { /* > 10 seconds buffered */
+                if (!overbuf_warned) {
+                    fprintf(stderr, "Warning: can't keep up, skipping audio\n");
+                    overbuf_warned = 1;
+                }
+                /* Drain all but last ~2 seconds */
+                float discard[4800];
+                while (vox_mic_read_available() > 32000)
+                    vox_mic_read(discard, 4800);
+                silence_count = 0;
+                was_skipping = 0;
+            } else if (avail < 64000) { /* < 4 seconds: clear warning */
+                overbuf_warned = 0;
+            }
+
+            int n = vox_mic_read(mic_buf, 4800);
+            if (n == 0) {
+#ifdef _WIN32
+                Sleep(10);
+#else
+                usleep(10000); /* 10ms idle sleep */
+#endif
+                continue;
+            }
+
+            /* Process in 10ms windows for silence cancellation */
+            int off = 0;
+            while (off + MIC_WINDOW <= n) {
+                /* Compute RMS energy of this window */
+                float energy = 0;
+                for (int i = 0; i < MIC_WINDOW; i++) {
+                    float v = mic_buf[off + i];
+                    energy += v * v;
+                }
+                float rms = sqrtf(energy / MIC_WINDOW);
+
+                if (rms > SILENCE_THRESH) {
+                    /* Voice detected */
+                    if (was_skipping)
+                        was_skipping = 0;
+                    vox_stream_feed(s, mic_buf + off, MIC_WINDOW);
+                    silence_count = 0;
+                } else {
+                    /* Silence detected */
+                    silence_count++;
+                    if (silence_count <= SILENCE_PASS) {
+                        /* Short silence: pass through (natural word gap) */
+                        vox_stream_feed(s, mic_buf + off, MIC_WINDOW);
+                    } else if (!was_skipping) {
+                        /* Entering silence: flush buffered audio */
+                        was_skipping = 1;
+                        vox_stream_flush(s);
+                    }
+                }
+                off += MIC_WINDOW;
+            }
+
+            /* Feed any remaining samples (< 1 window) */
+            if (off < n)
+                vox_stream_feed(s, mic_buf + off, n - off);
+
+            drain_tokens(s);
+        }
+
+        vox_mic_stop();
+        if (vox_verbose >= 1)
+            fprintf(stderr, "\nStopping...\n");
+
+        vox_stream_finish(s);
+        drain_tokens(s);
+        fputs("\n", stdout);
+        fflush(stdout);
+    } else if (use_stdin) {
         /* Peek at first 4 bytes to detect WAV vs raw */
         uint8_t hdr[4];
         size_t hdr_read = fread(hdr, 1, 4, stdin);
@@ -263,6 +405,11 @@ int main(int argc, char **argv) {
                 drain_tokens(s);
             }
         }
+
+        vox_stream_finish(s);
+        drain_tokens(s);
+        fputs("\n", stdout);
+        fflush(stdout);
     } else {
         /* File input: load WAV, feed in chunks */
         int n_samples = 0;
@@ -279,17 +426,27 @@ int main(int argc, char **argv) {
 
         feed_and_drain(s, samples, n_samples);
         free(samples);
+
+        vox_stream_finish(s);
+        drain_tokens(s);
+        fputs("\n", stdout);
+        fflush(stdout);
     }
 
-    vox_stream_finish(s);
-    drain_tokens(s);
-    fputs("\n", stdout);
-    fflush(stdout);
+    if (!use_mic) {
+        double run_ms = vox_get_time_ms() - t0_run_ms;
+        if (force_timing) {
+            fprintf(stderr, "Wall transcribe: %.0f ms\n", run_ms);
+        }
+    }
 
     vox_stream_free(s);
     vox_free(ctx);
 #ifdef USE_METAL
     vox_metal_shutdown();
+#endif
+#ifdef USE_CUDA
+    vox_cuda_shutdown();
 #endif
     return 0;
 }

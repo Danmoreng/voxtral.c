@@ -23,6 +23,10 @@ make test
 ./voxtral -d voxtral-model -i audio.wav --debug     # per-layer/per-chunk details
 ./voxtral -d voxtral-model -i audio.wav --alt 0.5   # show alternative tokens inline
 
+# Microphone input (macOS only, Ctrl+C to stop)
+./voxtral -d voxtral-model --from-mic               # default: 2s processing interval
+./voxtral -d voxtral-model --from-mic -I 1.0         # 1s interval for lower latency
+
 # Stdin input (auto-detects WAV vs raw s16le 16kHz mono)
 cat audio.wav | ./voxtral -d voxtral-model --stdin
 ffmpeg -i samples/I_have_a_dream.ogg -f s16le -ar 16000 -ac 1 - | ./voxtral -d voxtral-model --stdin
@@ -46,6 +50,8 @@ voxtral_audio.c/.h          - WAV loading, mel spectrogram, incremental mel
 voxtral_tokenizer.c/.h      - Tekken tokenizer
 voxtral_kernels.c/.h        - Math kernels (matmul, attention, norms)
 voxtral_safetensors.c/.h    - Safetensors reader (mmap)
+voxtral_mic.h               - Microphone capture API
+voxtral_mic_macos.c         - macOS mic capture (AudioQueue)
 voxtral_metal.m/.h          - Metal GPU backend
 voxtral_shaders.metal       - Metal compute shaders
 python_simple_implementation.py - Self-contained Python reference
@@ -89,7 +95,7 @@ See MODEL.md for full architecture details, weight tensor names, tokenizer layou
 4. Simple, understandable code
 5. No dead code
 6. Standard C only (no compiler-specific tricks)
-7. WAV file input, or stdin (WAV or raw s16le 16kHz mono)
+7. WAV file input, stdin (WAV or raw s16le 16kHz mono), or microphone (macOS)
 8. BF16 weights, F32 computation on CPU
 9. Keep MODEL.md updated as the architecture reference
 

@@ -8,9 +8,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef USE_METAL
 #include "voxtral_metal.h"
+#endif
+
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
 #endif
 
 #ifdef USE_BLAS
@@ -102,6 +111,12 @@ void vox_add_inplace(float *a, const float *b, int n) {
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(a + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
     }
+#else
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < n; i++) a[i] += b[i];
+    return;
 #endif
     for (; i < n; i++) a[i] += b[i];
 }
@@ -116,6 +131,12 @@ void vox_mul_inplace(float *a, const float *b, int n) {
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
     }
+#else
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < n; i++) a[i] *= b[i];
+    return;
 #endif
     for (; i < n; i++) a[i] *= b[i];
 }
@@ -132,6 +153,12 @@ void vox_axpy(float *a, float scale, const float *b, int n) {
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(a + i, _mm256_fmadd_ps(s, _mm256_loadu_ps(b + i), _mm256_loadu_ps(a + i)));
     }
+#else
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < n; i++) a[i] += scale * b[i];
+    return;
 #endif
     for (; i < n; i++) a[i] += scale * b[i];
 }
@@ -148,6 +175,12 @@ void vox_scale(float *x, float s, int n) {
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), s_vec));
     }
+#else
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < n; i++) x[i] *= s;
+    return;
 #endif
     for (; i < n; i++) x[i] *= s;
 }
@@ -166,6 +199,23 @@ void vox_copy(float *dst, const float *src, int n) {
 #define BLOCK_K 64
 
 void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_CUDA
+    static int logged_cuda = 0;
+    static int logged_fallback = 0;
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS) {
+        if (vox_cuda_matmul(C, A, B, M, K, N)) {
+            if (!logged_cuda && vox_verbose >= 2) {
+                fprintf(stderr, "[kernels] backend=CUDA (device=%s)\n", vox_cuda_device_name());
+                logged_cuda = 1;
+            }
+            return;
+        }
+        if (!logged_fallback && vox_verbose >= 2) {
+            fprintf(stderr, "[kernels] CUDA unavailable for matmul, falling back to CPU/BLAS\n");
+            logged_fallback = 1;
+        }
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
@@ -205,6 +255,23 @@ void vox_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
 }
 
 void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_CUDA
+    static int logged_cuda_t = 0;
+    static int logged_fallback_t = 0;
+    if ((size_t)M * K * N >= MIN_GPU_ELEMENTS) {
+        if (vox_cuda_matmul_t(C, A, B, M, K, N)) {
+            if (!logged_cuda_t && vox_verbose >= 2) {
+                fprintf(stderr, "[kernels] backend=CUDA transpose path\n");
+                logged_cuda_t = 1;
+            }
+            return;
+        }
+        if (!logged_fallback_t && vox_verbose >= 2) {
+            fprintf(stderr, "[kernels] CUDA unavailable for matmul_t, falling back to CPU/BLAS\n");
+            logged_fallback_t = 1;
+        }
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
@@ -247,11 +314,9 @@ void vox_matmul_t(float *C, const float *A, const float *B, int M, int K, int N)
 
 void vox_linear(float *y, const float *x, const float *W, const float *b,
                 int seq_len, int in_dim, int out_dim) {
-#ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                seq_len, out_dim, in_dim,
-                1.0f, x, in_dim, W, in_dim,
-                0.0f, y, out_dim);
+    /* Implement Linear in terms of matmul_t so CUDA path is available even
+     * when OpenBLAS isn't present (e.g. CUDA-only Linux builds). */
+    vox_matmul_t(y, x, W, seq_len, in_dim, out_dim);
     if (b != NULL) {
         for (int s = 0; s < seq_len; s++) {
             for (int o = 0; o < out_dim; o++) {
@@ -259,21 +324,6 @@ void vox_linear(float *y, const float *x, const float *W, const float *b,
             }
         }
     }
-#else
-    int s, o, i;
-    #pragma omp parallel for private(o, i)
-    for (s = 0; s < seq_len; s++) {
-        for (o = 0; o < out_dim; o++) {
-            const float *x_row = x + s * in_dim;
-            const float *w_row = W + o * in_dim;
-            float sum = (b != NULL) ? b[o] : 0.0f;
-            for (i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
-            }
-            y[s * out_dim + o] = sum;
-        }
-    }
-#endif
 }
 
 void vox_linear_nobias(float *y, const float *x, const float *W,
@@ -387,6 +437,14 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         return;
     }
 #endif
+#ifdef USE_CUDA
+    /* Decoder hot path uses seq_len=1. On x86 this CPU matvec is very slow, so
+     * prefer cuBLAS BF16 GEMM for sufficiently large weights. */
+    size_t elems = (size_t)in_dim * (size_t)out_dim;
+    if (elems >= (size_t)256 * 1024) {
+        if (vox_cuda_matmul_t_bf16(y, x, W_bf16, seq_len, in_dim, out_dim)) return;
+    }
+#endif
 #ifdef USE_AVX512BF16
     if (seq_len > 1) {
         avx512bf16_check();
@@ -406,7 +464,8 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
     bf16_to_f32_buf(W_f32, W_bf16, n);
-    vox_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+    /* Route through matmul_t to take CUDA path for large matrices. */
+    vox_matmul_t(y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
 void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
@@ -422,6 +481,12 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
             }
         }
         return;
+    }
+#endif
+#ifdef USE_CUDA
+    size_t elems = (size_t)in_dim * (size_t)out_dim;
+    if (elems >= (size_t)256 * 1024) {
+        if (vox_cuda_linear_bf16(y, x, W_bf16, b, seq_len, in_dim, out_dim)) return;
     }
 #endif
 #ifdef USE_AVX512BF16
@@ -467,6 +532,12 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(M, N, K, A, B_bf16, C);
         return;
+    }
+#endif
+#ifdef USE_CUDA
+    size_t elems = (size_t)K * (size_t)N;
+    if (elems >= (size_t)256 * 1024) {
+        if (vox_cuda_matmul_t_bf16(C, A, B_bf16, M, K, N)) return;
     }
 #endif
 #ifdef USE_AVX512BF16
@@ -522,7 +593,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
                        int channels_in, int channels_out, int length,
                        int kernel_size, int stride) {
     /* Matches vLLM WhisperCausalConv1d padding scheme.
-     * Uses im2col + BLAS sgemm for fast computation. */
+     * Uses im2col + matmul (CUDA/BLAS when available) for fast computation. */
     int padding_total = kernel_size - stride;
     float n_frames = ((float)length - kernel_size + padding_total) / (float)stride + 1.0f;
     int out_length = (int)ceilf(n_frames);
@@ -578,7 +649,11 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
 
 void vox_rms_norm(float *out, const float *x, const float *weight,
                   int seq_len, int hidden, float eps) {
-    for (int s = 0; s < seq_len; s++) {
+    int s;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
 
@@ -689,6 +764,15 @@ void vox_silu(float *x, int n) {
         __m256 res = _mm256_div_ps(vx, _mm256_add_ps(one, vexp));
         _mm256_storeu_ps(x + i, res);
     }
+#else
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < n; i++) {
+        float val = x[i];
+        x[i] = val / (1.0f + expf(-val));
+    }
+    return;
 #endif
     for (; i < n; i++) {
         float val = x[i];
@@ -733,6 +817,17 @@ void vox_gelu(float *x, int n) {
         __m256 res = _mm256_mul_ps(half, _mm256_mul_ps(vx, _mm256_add_ps(one, vtanh)));
         _mm256_storeu_ps(x + i, res);
     }
+#else
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < n; i++) {
+        float val = x[i];
+        float x3 = val * val * val;
+        float inner = 0.7978845608028654f * (val + 0.044715f * x3);
+        x[i] = 0.5f * val * (1.0f + tanhf(inner));
+    }
+    return;
 #endif
     for (; i < n; i++) {
         float val = x[i];
@@ -772,13 +867,25 @@ void vox_causal_attention(float *out, const float *Q, const float *K, const floa
                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
                           int head_dim, float scale, int window_size,
                           int q_offset) {
+#ifdef USE_CUDA
+    /* GPU offload for large attention workloads (encoder hot path).
+     * Keep thresholds conservative to avoid overhead on tiny decode/prefill shapes. */
+    if (seq_q >= 128 && seq_k >= 128 && head_dim <= 128 && n_heads <= 32) {
+        if (vox_cuda_causal_attention(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads,
+                                      head_dim, scale, window_size, q_offset)) {
+            return;
+        }
+    }
+#endif
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
-    /* Process each query head in parallel */
+    /* Process each query head */
     int h;
-    #pragma omp parallel for private(h)
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_kv;  /* GQA: map query head to KV head */
 
@@ -868,13 +975,15 @@ void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_d
     int half_dim = head_dim / 2;
     int hidden = heads * head_dim;
 
-    int s, h, d;
-    #pragma omp parallel for private(h, d)
+    int s;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (s = 0; s < seq; s++) {
-        for (h = 0; h < heads; h++) {
+        for (int h = 0; h < heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-            for (d = 0; d < half_dim; d++) {
+            for (int d = 0; d < half_dim; d++) {
                 float cos_val = freqs[s * half_dim * 2 + d * 2];
                 float sin_val = freqs[s * half_dim * 2 + d * 2 + 1];
 

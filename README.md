@@ -2,7 +2,7 @@
 
 This is a C implementation of the inference pipeline for the [Mistral AI's Voxtral Realtime 4B model](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602). It has zero external dependencies beyond the C standard library. The MPS inference is decently fast, while the BLAS acceleration is usable but slow (it continuously convert the bf16 weights to fp32).
 
-Audio processing uses a chunked encoder with overlapping windows, bounding memory usage regardless of input length. Audio can also be piped from stdin (`--stdin`), making it easy to transcode and transcribe any format via ffmpeg. A streaming C API (`vox_stream_t`) lets you feed audio incrementally and receive token strings as they become available.
+Audio processing uses a chunked encoder with overlapping windows, bounding memory usage regardless of input length. Audio can also be piped from stdin (`--stdin`), or captured live from the microphone (`--from-mic`, macOS), making it easy to transcode and transcribe any format via ffmpeg. A streaming C API (`vox_stream_t`) lets you feed audio incrementally and receive token strings as they become available.
 
 **More testing needed:** please note that this project was mostly tested against few samples, and likely requires some more work to be production quality. However the hard part, to understand the model inference and reproduce the inference pipeline, is here, so the rest likely can be done easily. Testing it against very long transcriptions, able to stress the KV cache circular buffer, will be a useful task.
 
@@ -19,6 +19,7 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
+# or: make cuda    # NVIDIA CUDA/cuBLAS (Linux/WSL2)
 # or: make avx512  # AVX-512 BF16 direct (no OpenBLAS needed)
 # or: make cpu     # Pure C, no dependencies (slower)
 
@@ -27,6 +28,15 @@ make mps       # Apple Silicon (fastest)
 
 # Transcribe audio
 ./voxtral -d voxtral-model -i audio.wav
+```
+
+```bash
+# Live microphone transcription (macOS, Ctrl+C to stop)
+./voxtral -d voxtral-model --from-mic
+
+# Pipe any format via ffmpeg
+ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
+    ./voxtral -d voxtral-model --stdin
 ```
 
 ### Windows
@@ -66,6 +76,7 @@ This requires just PyTorch and a few standard libraries.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word.
 - **Streaming C API**: Feed audio incrementally, get token strings back as they become available.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors, loading is near-instant.
+- **Live microphone input**: `--from-mic` captures and transcribes from the default microphone (macOS) with automatic silence detection.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Chunked encoder**: Processes audio in overlapping chunks, bounding memory regardless of length.
 - **Rolling KV cache**: Decoder KV cache is automatically compacted when it exceeds the sliding window (8192 positions), capping memory usage and allowing unlimited-length audio.
@@ -125,7 +136,25 @@ ffmpeg -i podcast.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 cat recording.wav | ./voxtral -d voxtral-model --stdin
 ```
 
-`--stdin` and `-i` are mutually exclusive.
+### Live Microphone Input
+
+The **`--from-mic` flag** captures audio from the default microphone (macOS only, uses AudioQueue Services). Press Ctrl+C to stop. Silence is automatically detected and stripped to reduce encoder/decoder work when you pause speaking — only actual speech is processed.
+
+```bash
+./voxtral -d voxtral-model --from-mic                # default 2s processing interval
+./voxtral -d voxtral-model --from-mic -I 1.0          # lower latency
+./voxtral -d voxtral-model --from-mic --silent         # no stderr status
+```
+
+If the model falls behind real-time, a warning is printed and audio is skipped to catch up.
+
+`--from-mic`, `--stdin`, and `-i` are mutually exclusive.
+
+If you are piping raw PCM and want to reduce overhead (process in larger chunks), you can set:
+
+```bash
+VOX_STDIN_INTERVAL_SEC=2 ./voxtral -d voxtral-model --stdin
+```
 
 To convert files to WAV format, just use `ffmpeg`:
 
@@ -201,6 +230,8 @@ vox_stream_free(s);
 
 `feed()` runs the mel spectrogram, encoder, and decoder on available data, queuing output tokens. `finish()` adds padding and processes remaining audio. `get()` retrieves pending tokens — call it after each `feed()` or whenever convenient. Token string pointers returned by `vox_stream_get()` are valid until `vox_stream_free()`.
 
+`vox_stream_flush(s)` forces the encoder to process whatever audio is buffered, regardless of the processing interval, and feeds right-padding so the decoder emits tokens that are behind the delay window. Unlike `finish()`, the stream stays open — you can continue feeding audio afterwards. This is useful for silence detection: when the speaker pauses, flush to get the pending transcription without ending the stream.
+
 Use `vox_set_processing_interval(s, seconds)` to control the latency/efficiency tradeoff (equivalent to `-I` on the CLI). When set, `feed()` accumulates audio but only runs the encoder/decoder after at least the specified duration of new audio has been fed. Lower values give more responsive streaming (text appears sooner), higher values batch more audio per encoder call for better GPU utilization. Default is 2.0 seconds. See the `-I` flag documentation above for guidance on choosing values.
 
 **Alternative tokens** — when the model is uncertain, retrieve competing candidates:
@@ -237,6 +268,7 @@ Choose a backend when building:
 ```bash
 make            # Show available backends
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
+make cuda       # NVIDIA CUDA/cuBLAS acceleration (Linux/WSL2)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
 make avx512     # AVX-512 BF16 direct (Windows/Linux, no OpenBLAS needed)
 make cpu        # Pure C, no dependencies (slower)
@@ -245,7 +277,8 @@ make cpu        # Pure C, no dependencies (slower)
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with OpenBLAS: `make blas`
+- Linux with NVIDIA GPU (including WSL2): `make cuda`
+- Linux CPU-only / OpenBLAS: `make blas`
 - Windows: `.\build.ps1`
 - Windows/Linux with AVX-512 BF16: `make avx512` or `.\build.ps1 -Avx512` (For AMD Zen 4+ and Intel Sapphire Rapids+ CPUs. A runtime check will print an error if the CPU lacks support.)
 
@@ -338,3 +371,95 @@ WAV → 16kHz → Mel Spectrogram → Conv Stem → Encoder → Downsample 4x �
 ## License
 
 MIT
+
+## CUDA on Windows 11 + WSL2 (Ubuntu)
+
+This repository now includes a CUDA backend that uses **cuBLAS** for large matrix multiplies (`make cuda`).
+The CUDA backend uses the CUDA **driver API** (`libcuda`) and does not require linking against `libcudart`.
+
+### Prerequisites
+
+1. Install the latest NVIDIA Windows driver with WSL CUDA support.
+2. Install WSL2 + Ubuntu 22.04+.
+3. Inside Ubuntu, install the CUDA toolkit (includes `nvcc`, `cublas`, and runtime libraries).
+
+### Build
+
+```bash
+make cuda
+# or if CUDA toolkit is installed elsewhere:
+make cuda CUDA_HOME=/usr/local/cuda
+```
+
+The build now performs a preflight check for `cuda.h` + `cublas_v2.h` under `${CUDA_HOME}/include`.
+
+Optional (Linux): enable OpenMP for faster CPU-side kernels:
+
+```bash
+make cuda OPENMP=1
+```
+
+### Verify CUDA visibility in WSL2
+
+```bash
+nvidia-smi
+```
+
+If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will offload large GEMMs to the GPU.
+
+
+### Recommended WSL2 versions (known-good baseline)
+
+- Windows 11 with recent NVIDIA Game Ready or Studio driver that includes WSL CUDA support.
+- Ubuntu 22.04+ in WSL2.
+- CUDA toolkit in Ubuntu (`cuda.h`, `libcublas`).
+
+### Troubleshooting
+
+- `cuda.h not found`: install CUDA toolkit in Ubuntu and/or set `CUDA_HOME`.
+- `error while loading shared libraries: libcublas.so`: ensure `${CUDA_HOME}/lib64` is in linker path (or build with correct `CUDA_HOME`).
+- `nvidia-smi` fails in WSL2: update Windows NVIDIA driver and verify WSL GPU support is enabled.
+- OOM during long runs: reduce concurrent workloads and close GPU-intensive apps on host Windows.
+
+### Validation and benchmark helpers
+
+```bash
+# Build + optional smoke test
+./scripts/validate_cuda.sh voxtral-model samples/test_speech.wav
+
+# Compare BLAS vs CUDA timing + output files
+./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+```
+
+
+### Driver / Toolkit matrix (known-good starting point)
+
+| Layer | Recommended |
+|---|---|
+| Windows host | Windows 11 23H2+ |
+| NVIDIA driver | R550+ with WSL CUDA support |
+| WSL | WSL2 (`wsl --update`) |
+| Ubuntu guest | 22.04 LTS or 24.04 LTS |
+| CUDA toolkit in Ubuntu | 12.4+ |
+| GPU class tested target | RTX 3080 Ti |
+
+### Real-time microphone pipeline recipe (WSL2)
+
+```bash
+# Windows host: capture mic with ffmpeg (or equivalent) and pipe raw PCM into WSL voxtral
+# Example run *inside* WSL when mic source is exposed by ffmpeg:
+ffmpeg -f pulse -i default -f s16le -ar 16000 -ac 1 - 2>/dev/null |   ./voxtral -d voxtral-model --stdin
+```
+
+If `pulse` is unavailable in your WSL distribution, use a host-side capture path and stream PCM into WSL over stdin or TCP.
+
+### Accuracy regression helper
+
+```bash
+# Compares BLAS vs CUDA transcripts with token mismatch tolerance (default: 0.5%)
+./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
+```
+
+### CUDA / WSL2 Notes
+
+For detailed bringup, benchmark results, and profiling notes, see `PR_NOTES_CUDA_WSL2.md`.

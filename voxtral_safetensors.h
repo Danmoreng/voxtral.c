@@ -44,6 +44,7 @@ typedef struct {
     size_t file_size;
     size_t header_size;
     char *header_json;
+    int is_mmap;
     int num_tensors;
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS];
 } safetensors_file_t;
@@ -63,6 +64,9 @@ const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t
 /* Get tensor data as float32 array (allocates, caller must free)
  * Handles conversion from F16/BF16 */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
+
+/* Same as above but always returns CPU memory */
+float *safetensors_get_f32_cpu(const safetensors_file_t *sf, const safetensor_t *t);
 
 /* Get tensor data as raw bf16 array (allocates, caller must free)
  * Only works for BF16 tensors. Returns NULL for other dtypes. */
