@@ -87,6 +87,9 @@ void vox_cuda_stream_adapter_reset(void);
  * build the initial decoder prompt on CPU without copying the full adapter. */
 int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens);
 
+/* Compact the device-side adapter buffer after consuming tokens. */
+void vox_cuda_stream_adapter_compact(int consumed_tokens, int remaining_tokens);
+
 /* Run CUDA full encoder+adapter and append the resulting adapter embeddings
  * to the internal device-side adapter buffer. Returns 1 on success. */
 int vox_cuda_encode_adapter_stream_append(int *out_tokens,

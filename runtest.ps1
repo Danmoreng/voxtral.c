@@ -3,15 +3,22 @@
 
 $ErrorActionPreference = "Stop"
 
+# Ensure relative paths resolve from this script's directory.
+if ($PSScriptRoot) { Set-Location -Path $PSScriptRoot }
+$ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
 # --- Paths (relative to current working directory) ---
-$ModelDir   = "voxtral-model"
-$InputWav   = "samples\jfk.wav"
-$VoxtralExe = ".\voxtral.exe"
+$ModelDir   = Join-Path $ScriptRoot "voxtral-model"
+$InputWav   = Join-Path $ScriptRoot "samples\jfk.wav"
+$VoxtralExe = Join-Path $ScriptRoot "voxtral.exe"
 
 # --- Streaming parameters ---
 $IntervalSec = "0.1"
 $ChunkSec    = 0.1   # how we drip-feed audio (simulate streaming)
 $RequireCuda = $true
+
+# Ensure full CUDA pipeline is enabled for tests by default.
+$env:VOX_CUDA_PIPELINE_FULL = "1"
 
 # Phrases expected in JFK sample
 $Phrases = @(
@@ -114,6 +121,7 @@ function Start-Proc([string]$exe, [string]$argString, [bool]$redirectStdin) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $exe
   $psi.Arguments = $argString
+  $psi.WorkingDirectory = $ScriptRoot
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
   $psi.RedirectStandardOutput = $true

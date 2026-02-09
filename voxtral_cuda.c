@@ -614,6 +614,35 @@ int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens) {
     return 1;
 }
 
+void vox_cuda_stream_adapter_compact(int consumed_tokens, int remaining_tokens) {
+    if (!vox_cuda_available()) return;
+    if (consumed_tokens <= 0) return;
+    if (!g_stream_adapter || g_stream_adapter_len <= 0) return;
+
+    int available = g_stream_adapter_len - consumed_tokens;
+    if (available <= 0) {
+        g_stream_adapter_len = 0;
+        return;
+    }
+
+    if (remaining_tokens < 0 || remaining_tokens > available) remaining_tokens = available;
+    if (remaining_tokens == 0) {
+        g_stream_adapter_len = 0;
+        return;
+    }
+
+    (void)cuCtxSetCurrent(g_ctx);
+    size_t bytes = (size_t)remaining_tokens * (size_t)VOX_DEC_DIM * sizeof(float);
+    CUdeviceptr src = g_stream_adapter + (size_t)consumed_tokens * (size_t)VOX_DEC_DIM * sizeof(float);
+    if (src != g_stream_adapter) {
+        CUresult r = cuMemcpyDtoDAsync(g_stream_adapter, src, bytes, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("DtoD(adapter_compact)", r); return; }
+        r = cuStreamSynchronize(g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("sync(adapter_compact)", r); return; }
+    }
+    g_stream_adapter_len = remaining_tokens;
+}
+
 typedef struct {
     const uint16_t *host;
     CUdeviceptr dev;

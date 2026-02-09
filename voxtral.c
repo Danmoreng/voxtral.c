@@ -752,6 +752,35 @@ static int stream_strict_eos(void) {
     return cached;
 }
 
+static int stream_use_cuda_pipeline_full(void) {
+#ifdef USE_CUDA
+    static int cached = -1;
+    if (cached != -1) return cached;
+    if (!vox_cuda_available()) { cached = 0; return cached; }
+    const char *disable = getenv("VOX_DISABLE_CUDA_PIPELINE_FULL");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
+    cached = (env && env[0] && env[0] != '0');
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+static int stream_use_cuda_encoder_full(void) {
+#ifdef USE_CUDA
+    static int cached = -1;
+    if (cached != -1) return cached;
+    if (!vox_cuda_available()) { cached = 0; return cached; }
+    const char *disable = getenv("VOX_DISABLE_CUDA_ENCODER_FULL");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    cached = 1;
+    return cached;
+#else
+    return 0;
+#endif
+}
+
 /* Compact adapter buffer: discard tokens the decoder has already consumed */
 static void stream_adapter_compact(vox_stream_t *s) {
     if (!s->adapter_buf) return;
