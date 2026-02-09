@@ -12,3 +12,4 @@ misc/
 *.exe
 *.wav
 build_log*.txt
+*.log
